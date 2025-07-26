@@ -19,3 +19,9 @@ This project contains all web scraping tools for [ToolTally](https://github.com/
 ```bash
 git clone https://github.com/DustInTheDark/tooltally-scrapers.git
 cd tooltally-scrapers
+```
+
+### 2. Run the Screwfix spider
+
+```bash
+scrapy crawl screwfix -a query=drill -o output/products.json
