@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import os
 
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - optional dependency
+    def load_dotenv() -> None:
+        """Fallback no-op if python-dotenv is not installed."""
+        pass
 from sqlalchemy import (
     Column,
     DateTime,
@@ -57,3 +62,4 @@ class Product(Base):
 def init_db() -> None:
     """Create tables in the database if they do not already exist."""
     Base.metadata.create_all(bind=engine)
+
