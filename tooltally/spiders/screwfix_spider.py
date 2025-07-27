@@ -1,7 +1,24 @@
+"""
+Wrapper to launch the Screwfix spider.
+
+If a search term is provided as the first command‑line argument, it will be
+passed to the spider.  If no argument is provided, an empty string is used,
+triggering the spider to scrape all categories.
+"""
+
+import sys
 import json
 import os
 import scrapy
+from scrapy.cmdline import execute
 from scrapy_playwright.page import PageMethod
+
+if __name__ == "__main__":
+    # Use the first argument as query if supplied; otherwise default to empty string.
+    query = sys.argv[1] if len(sys.argv) > 1 else ""
+    # Launch the spider.  The query is passed via -a query={...} but the spider
+    # ignores it when it's blank.
+    execute(["scrapy", "crawl", "screwfix", "-a", f"query={query}"])
 
 class ScrewfixSpider(scrapy.Spider):
     name = "screwfix"
