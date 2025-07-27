@@ -1,49 +1,74 @@
 import json
 import os
-from urllib.parse import urlencode
-
 import scrapy
-
+from scrapy_playwright.page import PageMethod
 
 class ScrewfixSpider(scrapy.Spider):
     name = "screwfix"
     allowed_domains = ["screwfix.com"]
+
+    # Override settings for this spider
     custom_settings = {
-        'ROBOTSTXT_OBEY': False,
-        'USER_AGENT': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:117.0) '
-                       'Gecko/20100101 Firefox/117.0'),
-        'DEFAULT_REQUEST_HEADERS': {
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-GB,en;q=0.5',
+        "ROBOTSTXT_OBEY": False,
+        "USER_AGENT": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:117.0) "
+                       "Gecko/20100101 Firefox/117.0"),
+        "DOWNLOAD_HANDLERS": {
+            "http": "scrapy_playwright.handler.ScrapyPlaywrightDownloadHandler",
+            "https": "scrapy_playwright.handler.ScrapyPlaywrightDownloadHandler",
         },
+        "TWISTED_REACTOR": "twisted.internet.asyncioreactor.AsyncioSelectorReactor",
+        "PLAYWRIGHT_BROWSER_TYPE": "chromium",
+        "PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT": 60000,
+        "CONCURRENT_REQUESTS_PER_DOMAIN": 2,
+        "DOWNLOAD_DELAY": 1,
     }
 
-    def __init__(self, query=None, *args, **kwargs):
+    def __init__(self, query="", *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # query is ignored when scraping everything
+        # query is ignored – we crawl everything
         self.items = []
 
     async def start(self):
-        # Start at the home page to gather category links
-        yield scrapy.Request("https://www.screwfix.com/", callback=self.parse_home)
+        # Use Playwright to render the home page and extract category links
+        yield scrapy.Request(
+            "https://www.screwfix.com/",
+            meta={
+                "playwright": True,
+                "playwright_page_methods": [
+                    PageMethod("wait_for_selector", "a[href*='/c/']")
+                ],
+            },
+            callback=self.parse_home,
+        )
 
     def parse_home(self, response):
-        # Find links that look like category pages – adjust the selector as needed
-        for href in response.css("a[href*='/c/']::attr(href)").getall():
-            yield response.follow(href, callback=self.parse_category)
+        category_links = response.css("a[href*='/c/']::attr(href)").getall()
+        for href in category_links:
+            url = response.urljoin(href)
+            yield scrapy.Request(
+                url,
+                meta={
+                    "playwright": True,
+                    "playwright_page_methods": [
+                        PageMethod("wait_for_selector", ".ProductListItem")
+                    ],
+                },
+                callback=self.parse_category,
+            )
 
     def parse_category(self, response):
-        # Scrape products on this category page (same as your original parse)
-        for product in response.css("div.product, li.product, div.ProductListItem"):
-            title_parts = product.css("a ::text").getall()
-            title = " ".join(t.strip() for t in title_parts if t.strip())
-            price = product.css("span.price, span.Price::text, .price::text").get()
+        # Extract product details from a rendered category page
+        for product in response.css(".ProductListItem"):
+            title = " ".join(product.css("a ::text").getall()).strip()
+            price = product.css(".price ::text, .Price::text").get()
+            price = price.strip() if price else ""
             url = product.css("a::attr(href)").get()
             if url:
                 url = response.urljoin(url)
+
             item = {
                 "productTitle": title,
-                "price": price.strip() if price else "",
+                "price": price,
                 "vendorName": "Screwfix",
                 "buyUrl": url,
             }
@@ -53,7 +78,11 @@ class ScrewfixSpider(scrapy.Spider):
         # Follow pagination links
         next_page = response.css("a.pagination--next::attr(href), a[rel=next]::attr(href)").get()
         if next_page:
-            yield response.follow(next_page, callback=self.parse_category)
+            yield scrapy.Request(
+                response.urljoin(next_page),
+                meta=response.meta,
+                callback=self.parse_category,
+            )
 
     def closed(self, reason):
         os.makedirs("output", exist_ok=True)
