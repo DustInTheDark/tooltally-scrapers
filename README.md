@@ -27,7 +27,7 @@ pip install sqlalchemy psycopg2-binary python-dotenv scrapy
 Create a `.env` file with a `DATABASE_URL` pointing to your PostgreSQL instance, e.g.:
 
 ```
-DATABASE_URL=postgresql://user:password@localhost:5432/tooltally
+DATABASE_URL=postgresql://postgres:tooltally@localhost:5432/tooltally
 ```
 
 4. **Start your PostgreSQL server**
@@ -38,10 +38,13 @@ If a local database isn't already running, you can launch one quickly using Dock
 docker run --name tooltally-db -e POSTGRES_PASSWORD=tooltally -e POSTGRES_DB=tooltally -p 5432:5432 -d postgres
 ```
 
+The command above starts a PostgreSQL server with user `postgres`, password
+`tooltally`, and a database also named `tooltally`. Ensure your `DATABASE_URL`
+matches these values.
+
 5. **Initialise the database**
 
-The `scripts` directory is in the repository root.
-
+With the PostgreSQL server running, create the tables by executing:
 
 ```bash
 python scripts/init_db.py
