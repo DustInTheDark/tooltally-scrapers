@@ -48,3 +48,4 @@ class ScrewfixSpider(scrapy.Spider):
         os.makedirs("output", exist_ok=True)
         with open("output/products.json", "w", encoding="utf-8") as f:
             json.dump(self.items, f, ensure_ascii=False, indent=2)
+

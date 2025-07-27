@@ -32,12 +32,15 @@ DATABASE_URL=postgresql://user:password@localhost:5432/tooltally
 
 4. **Initialise the database**
 
-```bash
-python -c "from tooltally import init_db; init_db()"
-```
-
-5. **Run a spider**
+The `scripts` directory is in the repository root.
 
 ```bash
-scrapy crawl screwfix -a query=drill -o output/products.json
+python scripts/init_db.py
 ```
+
+5. **Run the Screwfix spider**
+
+```bash
+python scripts/scrape_screwfix.py drill
+```
+This saves the results to `output/products.json`.

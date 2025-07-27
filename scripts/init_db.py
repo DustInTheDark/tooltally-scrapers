@@ -1,30 +1,21 @@
 from __future__ import annotations
 
 import os
+import uuid
 
 try:
     from dotenv import load_dotenv
-except ImportError:  # pragma: no cover - optional dependency
+except ImportError:  # pragma: no cover
     def load_dotenv() -> None:
-        """Fallback no-op if python-dotenv is not installed."""
         pass
-from sqlalchemy import (
-    Column,
-    DateTime,
-    ForeignKey,
-    Numeric,
-    String,
-    func,
-    create_engine,
-)
+
+from sqlalchemy import Column, DateTime, ForeignKey, Numeric, String, create_engine, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
-import uuid
 
 load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL environment variable is not set")
 
@@ -32,6 +23,7 @@ engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine)
 
 Base = declarative_base()
+
 
 class Vendor(Base):
     __tablename__ = "vendors"
@@ -42,6 +34,7 @@ class Vendor(Base):
     logo_url = Column(String)
 
     products = relationship("Product", back_populates="vendor")
+
 
 class Product(Base):
     __tablename__ = "products"
@@ -63,3 +56,7 @@ def init_db() -> None:
     """Create tables in the database if they do not already exist."""
     Base.metadata.create_all(bind=engine)
 
+
+if __name__ == "__main__":
+    init_db()
+    print("Database initialized.")
