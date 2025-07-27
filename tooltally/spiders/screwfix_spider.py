@@ -9,7 +9,13 @@ class ScrewfixSpider(scrapy.Spider):
     name = "screwfix"
     allowed_domains = ["screwfix.com"]
     custom_settings = {
-        'ROBOTSTXT_OBEY': False
+        'ROBOTSTXT_OBEY': False,
+        'USER_AGENT': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:117.0) '
+                    'Gecko/20100101 Firefox/117.0'),
+        'DEFAULT_REQUEST_HEADERS': {
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-GB,en;q=0.5',
+        },
     }
 
     def __init__(self, query=None, *args, **kwargs):
@@ -18,8 +24,7 @@ class ScrewfixSpider(scrapy.Spider):
         self.query = query or ""
         self.items = []
 
-    def start_requests(self):
-        # If no specific search term, start at the category listing page
+    async def start(self):
         if not self.query or self.query.lower() == "all":
             url = "https://www.screwfix.com/c/"
             yield scrapy.Request(url, callback=self.parse_categories)
