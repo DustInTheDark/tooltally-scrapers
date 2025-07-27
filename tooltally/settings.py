@@ -14,6 +14,14 @@ NEWSPIDER_MODULE = "tooltally.spiders"
 
 ADDONS = {}
 
+# Playwright integration settings
+DOWNLOAD_HANDLERS = {
+    "http": "scrapy_playwright.handler.ScrapyPlaywrightDownloadHandler",
+    "https": "scrapy_playwright.handler.ScrapyPlaywrightDownloadHandler",
+}
+
+TWISTED_REACTOR = "twisted.internet.asyncioreactor.AsyncioSelectorReactor"
+PLAYWRIGHT_BROWSER_TYPE = "chromium"
 
 # Crawl responsibly by identifying yourself (and your website) on the user-agent
 #USER_AGENT = "tooltally (+http://www.yourdomain.com)"
