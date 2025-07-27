@@ -9,6 +9,11 @@ class ScrewfixSpider(scrapy.Spider):
     name = "screwfix"
     allowed_domains = ["screwfix.com"]
 
+    # Disable robots.txt rules for this spider so it can crawl the search pages.
+    custom_settings = {
+        'ROBOTSTXT_OBEY': False
+    }
+
     def __init__(self, query=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         if not query:
