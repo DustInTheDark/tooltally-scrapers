@@ -30,15 +30,24 @@ Create a `.env` file with a `DATABASE_URL` pointing to your PostgreSQL instance,
 DATABASE_URL=postgresql://user:password@localhost:5432/tooltally
 ```
 
-4. **Initialise the database**
+4. **Start your PostgreSQL server**
+
+If a local database isn't already running, you can launch one quickly using Docker:
+
+```bash
+docker run --name tooltally-db -e POSTGRES_PASSWORD=tooltally -e POSTGRES_DB=tooltally -p 5432:5432 -d postgres
+```
+
+5. **Initialise the database**
 
 The `scripts` directory is in the repository root.
+
 
 ```bash
 python scripts/init_db.py
 ```
 
-5. **Run the Screwfix spider**
+6. **Run the Screwfix spider**
 
 ```bash
 python scripts/scrape_screwfix.py drill
