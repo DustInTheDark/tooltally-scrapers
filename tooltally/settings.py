@@ -14,20 +14,12 @@ NEWSPIDER_MODULE = "tooltally.spiders"
 
 ADDONS = {}
 
-# Playwright integration settings
-DOWNLOAD_HANDLERS = {
-    "http": "scrapy_playwright.handler.ScrapyPlaywrightDownloadHandler",
-    "https": "scrapy_playwright.handler.ScrapyPlaywrightDownloadHandler",
-}
-
-TWISTED_REACTOR = "twisted.internet.asyncioreactor.AsyncioSelectorReactor"
-PLAYWRIGHT_BROWSER_TYPE = "chromium"
-
 # Crawl responsibly by identifying yourself (and your website) on the user-agent
 #USER_AGENT = "tooltally (+http://www.yourdomain.com)"
 
 # Obey robots.txt rules
 ROBOTSTXT_OBEY = True
+LOG_LEVEL = "INFO"
 
 # Concurrency and throttling settings
 #CONCURRENT_REQUESTS = 16
@@ -66,9 +58,9 @@ DOWNLOAD_DELAY = 1
 
 # Configure item pipelines
 # See https://docs.scrapy.org/en/latest/topics/item-pipeline.html
-#ITEM_PIPELINES = {
-#    "tooltally.pipelines.TooltallyPipeline": 300,
-#}
+ITEM_PIPELINES = {
+    "tooltally.pipelines.DatabasePipeline": 300,
+}
 
 # Enable and configure the AutoThrottle extension (disabled by default)
 # See https://docs.scrapy.org/en/latest/topics/autothrottle.html
