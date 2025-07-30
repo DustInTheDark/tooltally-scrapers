@@ -4,7 +4,6 @@ SPIDER_MODULES = ["tooltally.spiders"]
 NEWSPIDER_MODULE = "tooltally.spiders"
 
 ROBOTSTXT_OBEY = False
-
 CONCURRENT_REQUESTS_PER_DOMAIN = 1
 DOWNLOAD_DELAY = 1
 
@@ -14,12 +13,6 @@ USER_AGENT = (
     "Chrome/114.0.0.0 Safari/537.36"
 )
 
-ITEM_PIPELINES = {}
-
-FEEDS = {
-    "output/products.json": {
-        "format": "json",
-        "overwrite": True,
-        "encoding": "utf8"
-    }
+ITEM_PIPELINES = {
+    "tooltally.pipelines.DatabasePipeline": 300,
 }
