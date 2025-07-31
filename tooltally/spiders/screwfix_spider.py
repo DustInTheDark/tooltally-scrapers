@@ -35,12 +35,17 @@ class ScrewfixSpider(scrapy.Spider):
             try:
                 data = json.loads(json_ld)
                 for product in data.get("itemListElement", []):
+                    # Derive category from the URL path (e.g. drills, saws, etc.)
+                    category_slug = response.url.split("/c/tools/")[1].split("/")[0]
+                    category = category_slug.replace("-", " ").title()
+
                     yield {
-                        "productTitle": product.get("name"),
-                        "price": product.get("offers", {}).get("price"),
                         "vendorName": "Screwfix",
-                        "buyUrl": response.urljoin(product.get("url")),
-                        "sku": product.get("sku"),
+                        "product_code": product.get("sku"),
+                        "name": product.get("name"),
+                        "price": product.get("offers", {}).get("price"),
+                        "category": category,
+                        "url": response.urljoin(product.get("url")),
                     }
             except json.JSONDecodeError:
                 self.logger.warning("Failed to parse JSON-LD at %s", response.url)
