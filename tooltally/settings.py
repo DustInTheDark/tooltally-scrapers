@@ -13,6 +13,8 @@ USER_AGENT = (
     "Chrome/114.0.0.0 Safari/537.36"
 )
 
+# settings.py (relevant excerpt)
+
 ITEM_PIPELINES = {
-    "tooltally.pipelines.DatabasePipeline": 300,
+    'tooltally.pipelines.SQLitePipeline': 300,
 }
