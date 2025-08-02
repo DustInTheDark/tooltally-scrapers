@@ -1,8 +1,14 @@
-from tooltally.spiders import dandm_spider
+from scrapy.crawler import CrawlerProcess
+from scrapy.utils.project import get_project_settings
 
-import sys
-import os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+def main() -> None:
+    """Run the D&M Tools spider using the project's settings."""
+
+    process = CrawlerProcess(get_project_settings())
+    process.crawl("dandm")
+    process.start()
+
 
 if __name__ == "__main__":
-    dandm_spider.main()
+    main()
