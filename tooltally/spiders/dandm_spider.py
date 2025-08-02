@@ -78,6 +78,8 @@ class DandmSpider(scrapy.Spider):
                 full_text = price_div.xpath("normalize-space()").get("")
                 if full_text.upper().startswith("NOW"):
                     full_text = full_text[3:].strip()
+                if full_text.upper().startswith("ONLY"):
+                    full_text = full_text[4:].strip()
                 if " INC " in full_text:
                     price_text = full_text.split(" INC ")[0].strip()
                 else:
