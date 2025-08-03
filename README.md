@@ -1,58 +1,74 @@
 # 🕷️ ToolTally Scrapers
 
-This repository contains scraping utilities for the [ToolTally](https://github.com/DustInTheDark/tooltally-frontend) project. The scrapers gather product data from various UK tool vendors.
+Utilities for harvesting product data for the
+[ToolTally](https://github.com/DustInTheDark/tooltally-frontend) project.
+The spiders target several UK tool vendors and write the scraped results to a
+local SQLite database at `data/tooltally.db`.
 
-## Features
+## Supported vendors
 
-- Individual spiders for each vendor
-- Output JSON files that can be fed into the ToolTally database
+- D&M Tools
+- Screwfix
+- Toolstation
+- Toolstop
+- UK Planet Tools
 
-## Getting Started
+## Getting started
 
-1. **Clone the repo**
+1. **Clone the repository**
 
-```bash
-git clone https://github.com/DustInTheDark/tooltally-scrapers.git
-cd tooltally-scrapers
-```
+   ```bash
+   git clone https://github.com/DustInTheDark/tooltally-scrapers.git
+   cd tooltally-scrapers
+   ```
 
 2. **Install dependencies**
 
-```bash
-pip install sqlalchemy psycopg2-binary python-dotenv scrapy
-```
+   Create and activate a virtual environment (optional but recommended) and
+   install the required packages:
 
-3. **Configure your environment**
+   ```bash
+   pip install scrapy sqlalchemy psycopg2-binary python-dotenv
+   ```
 
-Create a `.env` file with a `DATABASE_URL` pointing to your PostgreSQL instance, e.g.:
+3. **(Optional) Configure PostgreSQL**
 
-```
-DATABASE_URL=postgresql://postgres:tooltally@localhost:5432/tooltally
-```
+   The scraping pipeline stores data in a local SQLite database. If you would
+   like to mirror the schema in PostgreSQL for use with other ToolTally
+   services, create a `.env` file containing a `DATABASE_URL` and initialise the
+   database:
 
-4. **Start your PostgreSQL server**
+   ```bash
+   echo "DATABASE_URL=postgresql://postgres:tooltally@localhost:5432/tooltally" > .env
+   python scripts/init_db.py
+   ```
 
-If a local database isn't already running, you can launch one quickly using Docker:
+## Running the scrapers
 
-```bash
-docker run --name tooltally-db -e POSTGRES_PASSWORD=tooltally -e POSTGRES_DB=tooltally -p 5432:5432 -d postgres
-```
-
-The command above starts a PostgreSQL server with user `postgres`, password
-`tooltally`, and a database also named `tooltally`. Ensure your `DATABASE_URL`
-matches these values.
-
-5. **Initialise the database**
-
-With the PostgreSQL server running, create the tables by executing:
+Each vendor has a dedicated script in the `scripts/` directory. Run them from
+the project root to populate `data/tooltally.db`:
 
 ```bash
-python scripts/init_db.py
+python scripts/scrape_dandm.py          # D&M Tools
+python scripts/scrape_screwfix.py       # Screwfix
+python scripts/scrape_toolstation.py    # Toolstation
+python scripts/scrape_toolstop.py       # Toolstop
+python scripts/scrape_ukplanettools.py  # UK Planet Tools
 ```
 
-6. **Run the Screwfix spider**
+Each script clears any proxy environment variables that might interfere with
+Scrapy's downloader and will create the SQLite database (and required tables)
+if it does not already exist. After a spider completes, the scraped products
+can be inspected using standard SQLite tooling, for example:
 
 ```bash
-python scripts/scrape_screwfix.py drill
+sqlite3 data/tooltally.db 'SELECT vendor_id, name, price FROM products LIMIT 10;'
 ```
-This saves the results to `output/products.json`.
+
+## Notes
+
+- Running the scrapers against live retail sites may take a while and be
+  subject to rate limiting. Be considerate and adhere to each site's terms of
+  use.
+- The scripts are intended for development and data collection purposes; they
+  are not a production‑grade, continuously running crawler.
