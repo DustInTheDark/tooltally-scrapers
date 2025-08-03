@@ -1,13 +1,20 @@
 import os
 import sqlite3
+import sys
+from pathlib import Path
+
 from scrapy.crawler import CrawlerProcess
 from scrapy.utils.project import get_project_settings
 
-DB_PATH = os.path.join("data", "tooltally.db")
+BASE_DIR = Path(__file__).resolve().parents[1]
+sys.path.append(str(BASE_DIR))
+from tooltally.spiders.ukplanettools_spider import UkplanettoolsSpider
+
+DB_PATH = BASE_DIR / "data" / "tooltally.db"
 
 def ensure_db() -> None:
     """Ensure the SQLite database and required tables exist."""
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    os.makedirs(DB_PATH.parent, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
@@ -45,7 +52,7 @@ def main() -> None:
     ensure_db()
 
     process = CrawlerProcess(get_project_settings())
-    process.crawl("ukplanettools")
+    process.crawl(UkplanettoolsSpider)
     process.start()
 
 if __name__ == "__main__":
