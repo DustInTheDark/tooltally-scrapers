@@ -25,10 +25,12 @@ local SQLite database at `data/tooltally.db`.
 2. **Install dependencies**
 
    Create and activate a virtual environment (optional but recommended) and
-   install the required packages:
+   install the required packages. The project now includes a
+   `requirements.txt` listing all Python dependencies, including Flask for the
+   API:
 
    ```bash
-   pip install scrapy sqlalchemy psycopg2-binary python-dotenv
+   pip install -r requirements.txt
    ```
 
 3. **(Optional) Configure PostgreSQL**
@@ -64,6 +66,27 @@ can be inspected using standard SQLite tooling, for example:
 ```bash
 sqlite3 data/tooltally.db 'SELECT vendor_id, name, price FROM products LIMIT 10;'
 ```
+
+## Running the API
+
+The repository includes a small Flask application (`api.py`) that serves the
+contents of `data/tooltally.db` for consumption by the front end. Start the
+server in a virtual environment after installing Flask:
+
+```bash
+pip install flask
+python api.py
+```
+
+Key endpoints:
+
+- `GET /products` – List deduplicated products. Supports optional `search` and
+  `category` query parameters for filtering.
+- `GET /products/<id>` – Return vendor prices and buy links for a product.
+- `GET /categories` – List all available categories.
+
+Set the `TOOLTALLY_DB` environment variable to point to a different SQLite
+database file if required.
 
 ## Notes
 
