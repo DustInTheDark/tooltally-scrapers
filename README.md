@@ -69,13 +69,19 @@ sqlite3 data/tooltally.db 'SELECT vendor_id, name, price FROM products LIMIT 10;
 
 ## Running the API
 
-The repository includes a small Flask application (`api.py`) that serves the
-contents of `data/tooltally.db` for consumption by the front end. Start the
-server in a virtual environment after installing Flask:
+The repository includes a small Flask application (`app.py`) that serves the
+contents of `data/tooltally.db` for consumption by the front end. Set up a
+virtual environment, install dependencies, and start the development server:
 
 ```bash
-pip install flask
-python api.py
+py -3 -m venv .venv
+.\.venv\Scripts\activate
+pip install -r requirements.txt
+
+set FLASK_APP=app.py
+set FLASK_ENV=development
+set SQLALCHEMY_DATABASE_URI=sqlite:///tooltally.db
+flask run --host=0.0.0.0 --port=5000
 ```
 
 Key endpoints:
@@ -85,8 +91,8 @@ Key endpoints:
 - `GET /products/<id>` – Return vendor prices and buy links for a product.
 - `GET /categories` – List all available categories.
 
-Set the `TOOLTALLY_DB` environment variable to point to a different SQLite
-database file if required.
+Set `SQLALCHEMY_DATABASE_URI` to point to a different SQLite database file if
+required.
 
 ## Notes
 
@@ -95,3 +101,4 @@ database file if required.
   use.
 - The scripts are intended for development and data collection purposes; they
   are not a production‑grade, continuously running crawler.
+  
