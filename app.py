@@ -1,85 +1,126 @@
-from flask import Flask, request, jsonify
-from sqlalchemy import create_engine, text
+"""Lightweight API for serving scraped product data.
+
+This Flask application exposes read-only endpoints backed by the
+``tooltally`` SQLite database.  The previous implementation relied on
+``engine.execute`` which was removed in SQLAlchemy 2.0.  The routes now
+use explicit connections via ``engine.connect()`` to remain compatible
+with modern versions of SQLAlchemy.
+"""
+
+from __future__ import annotations
+
+import decimal
 import os
+from typing import Any, Dict, List
+
+from flask import Flask, jsonify, request
+from sqlalchemy import create_engine, text
 
 app = Flask(__name__)
 
-# Determine database location; default to local SQLite file
-DATABASE_URI = os.environ.get("SQLALCHEMY_DATABASE_URI", "sqlite:///data/tooltally.db")
-engine = create_engine(DATABASE_URI)
+# Obtain the database URI from the environment with a sensible default.
+DATABASE_URI = os.getenv("SQLALCHEMY_DATABASE_URI", "sqlite:///data/tooltally.db")
+
+# ``future=True`` enables SQLAlchemy 2.0 style usage and ensures ``Engine``
+# provides ``connect`` for context managed execution.
+engine = create_engine(DATABASE_URI, future=True)
 
 
 @app.route("/")
-def home():
-    """Simple health check route."""
+def home() -> str:
+    """Basic health-check endpoint."""
     return "Backend is running!"
 
 
-@app.get("/products")
-def list_products():
-    """Return a list of products with optional search and category filters."""
+@app.route("/products")
+def list_products():  # pragma: no cover - simple query wrapper
+    """Return a list of products with optional filtering."""
+
     search = request.args.get("search")
     category = request.args.get("category")
 
-    base_query = """
-        SELECT p.id, p.name, p.category, MIN(vp.price) AS min_price
-        FROM products p
-        LEFT JOIN vendor_products vp ON p.id = vp.product_id
-    """
-    conditions = []
-    params = {}
+    filters: List[str] = []
+    params: Dict[str, Any] = {}
 
     if search:
-        conditions.append("(p.name LIKE :search OR p.brand LIKE :search)")
-        params["search"] = f"%{search}%"
-    if category:
-        conditions.append("p.category = :category")
-        params["category"] = category
-    if conditions:
-        base_query += " WHERE " + " AND ".join(conditions)
+        filters.append("LOWER(p.name) LIKE :search")
+        params["search"] = f"%{search.lower()}%"
 
-    base_query += " GROUP BY p.id ORDER BY p.name"
-    rows = engine.execute(text(base_query), params).mappings().all()
+    if category:
+        # Match categories case-insensitively so UI filters don't need exact casing
+        filters.append("LOWER(p.category) = :category")
+        params["category"] = category.lower()
+
+    where_clause = f"WHERE {' AND '.join(filters)}" if filters else ""
+
+    base_query = f"""
+        SELECT p.id, p.name, p.product_code, p.price, p.url, p.category,
+               v.name AS vendor_name
+        FROM products p
+        JOIN vendors v ON p.vendor_id = v.id
+        {where_clause}
+        ORDER BY p.name
+    """
+
+    with engine.connect() as conn:
+        result = conn.execute(text(base_query), params).mappings().all()
+
+    rows: List[Dict[str, Any]] = [dict(r) for r in result]
+
+    # ``decimal.Decimal`` instances are not JSON serialisable by default.
+    for row in rows:
+        if isinstance(row.get("price"), decimal.Decimal):
+            row["price"] = float(row["price"])
+
     return jsonify(rows)
 
 
-@app.get("/products/<int:product_id>")
-def product_detail(product_id: int):
-    """Return product details and vendor offers for a given product."""
-    product = engine.execute(
-        text("SELECT id, name, category FROM products WHERE id = :id"),
-        {"id": product_id},
-    ).mappings().first()
-    if not product:
+@app.route("/products/<int:product_id>")
+def get_product(product_id: int):  # pragma: no cover - simple query wrapper
+    """Return details for a single product."""
+
+    query = text(
+        """
+        SELECT p.id, p.name, p.product_code, p.price, p.url, p.category,
+               v.name AS vendor_name
+        FROM products p
+        JOIN vendors v ON p.vendor_id = v.id
+        WHERE p.id = :pid
+        """
+    )
+
+    with engine.connect() as conn:
+        result = conn.execute(query, {"pid": product_id}).mappings().first()
+
+    if not result:
         return jsonify({"error": "Product not found"}), 404
 
-    vendor_rows = engine.execute(
-        text(
-            """
-            SELECT v.name AS vendor, vp.price, vp.buy_url
-            FROM vendor_products vp
-            JOIN vendors v ON v.id = vp.vendor_id
-            WHERE vp.product_id = :id
-            ORDER BY vp.price
-            """
-        ),
-        {"id": product_id},
-    ).mappings().all()
+    row = dict(result)
 
-    product_dict = dict(product)
-    product_dict["vendors"] = vendor_rows
-    return jsonify(product_dict)
+    if isinstance(row.get("price"), decimal.Decimal):
+        row["price"] = float(row["price"])
+
+    return jsonify(row)
 
 
-@app.get("/categories")
-def list_categories():
-    """Return all distinct product categories."""
-    rows = engine.execute(
-        text("SELECT DISTINCT category FROM products WHERE category IS NOT NULL ORDER BY category")
-    ).fetchall()
-    categories = [row[0] for row in rows]
-    return jsonify(categories)
+@app.route("/categories")
+def list_categories():  # pragma: no cover - simple query wrapper
+    """Return a sorted list of distinct product categories."""
+
+    query = text(
+        """
+        SELECT DISTINCT category
+        FROM products
+        WHERE category IS NOT NULL AND category != ''
+        ORDER BY category
+        """
+    )
+
+    with engine.connect() as conn:
+        rows = conn.execute(query).scalars().all()
+
+    return jsonify(rows)
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     app.run(host="0.0.0.0", port=5000)
