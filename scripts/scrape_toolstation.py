@@ -40,8 +40,7 @@ def _title_from_url(url: str) -> Optional[str]:
         path = unquote(urlparse(url).path or "")
         seg = path.rstrip("/").rsplit("/", 1)[-1]
         seg = seg.split("?")[0].split("#")[0]
-        # Toolstation: product URL often ends with /p12345
-        seg = seg.split("/p")[0]
+        seg = seg.split("/p")[0]  # Toolstation often ends with /p12345
         text = seg.replace("-", " ").replace("_", " ").strip()
         return text or None
     except Exception:
@@ -56,7 +55,6 @@ def _norm_item(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     price = item.get("price_gbp") or item.get("price_pounds") or item.get("price") or item.get("current_price") or item.get("amount")
     price_gbp = _parse_price_to_float(price)
 
-    # Fallback: derive title from URL if missing
     if (not title) and url:
         title = _title_from_url(url)
 
@@ -87,8 +85,7 @@ def _make_process() -> CrawlerProcess:
     # Disable project pipelines & Telnet; we persist via raw_offers ourselves
     settings.set("ITEM_PIPELINES", {}, priority="cmdline")
     settings.set("EXTENSIONS", {"scrapy.extensions.telnet.TelnetConsole": None}, priority="cmdline")
-    # Quick-testing caps
-    settings.set("CLOSESPIDER_ITEMCOUNT", 60, priority="cmdline")
+    # Gentle crawl defaults
     settings.set("DOWNLOAD_DELAY", 1, priority="cmdline")
     settings.set("CONCURRENT_REQUESTS_PER_DOMAIN", 1, priority="cmdline")
     return CrawlerProcess(settings=settings)

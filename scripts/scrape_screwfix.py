@@ -1,4 +1,4 @@
-# scripts/scrape_screwfix.py
+# scripts/scrape_toolstation.py
 from __future__ import annotations
 
 import os, sys
@@ -17,8 +17,8 @@ from scrapy.utils.project import get_project_settings
 
 from scripts.raw_offers_writer import save_many_raw_offers
 
-VENDOR = "Screwfix"
-SPIDER_NAME = "screwfix"
+VENDOR = "Toolstation"
+SPIDER_NAME = "toolstation"
 
 
 def _parse_price_to_float(v: Any) -> Optional[float]:
@@ -40,6 +40,7 @@ def _title_from_url(url: str) -> Optional[str]:
         path = unquote(urlparse(url).path or "")
         seg = path.rstrip("/").rsplit("/", 1)[-1]
         seg = seg.split("?")[0].split("#")[0]
+        seg = seg.split("/p")[0]  # Toolstation often ends with /p12345
         text = seg.replace("-", " ").replace("_", " ").strip()
         return text or None
     except Exception:
@@ -73,17 +74,18 @@ def _norm_item(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 def _try_import_spider_class():
     try:
-        from tooltally.spiders.screwfix import ScrewfixSpider  # type: ignore
-        return ScrewfixSpider
+        from tooltally.spiders.toolstation import ToolstationSpider  # type: ignore
+        return ToolstationSpider
     except Exception:
         return None
 
 
 def _make_process() -> CrawlerProcess:
     settings = get_project_settings()
+    # Disable project pipelines & Telnet; we persist via raw_offers ourselves
     settings.set("ITEM_PIPELINES", {}, priority="cmdline")
     settings.set("EXTENSIONS", {"scrapy.extensions.telnet.TelnetConsole": None}, priority="cmdline")
-    settings.set("CLOSESPIDER_ITEMCOUNT", 60, priority="cmdline")
+    # Gentle crawl defaults
     settings.set("DOWNLOAD_DELAY", 1, priority="cmdline")
     settings.set("CONCURRENT_REQUESTS_PER_DOMAIN", 1, priority="cmdline")
     return CrawlerProcess(settings=settings)

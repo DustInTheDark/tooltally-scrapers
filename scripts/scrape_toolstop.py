@@ -1,4 +1,4 @@
-# scripts/scrape_toolstop.py
+# scripts/scrape_screwfix.py
 from __future__ import annotations
 
 import os, sys
@@ -17,8 +17,8 @@ from scrapy.utils.project import get_project_settings
 
 from scripts.raw_offers_writer import save_many_raw_offers
 
-VENDOR = "Toolstop"
-SPIDER_NAME = "toolstop"
+VENDOR = "Screwfix"
+SPIDER_NAME = "screwfix"
 
 
 def _parse_price_to_float(v: Any) -> Optional[float]:
@@ -73,8 +73,8 @@ def _norm_item(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 def _try_import_spider_class():
     try:
-        from tooltally.spiders.toolstop import ToolstopSpider  # type: ignore
-        return ToolstopSpider
+        from tooltally.spiders.screwfix import ScrewfixSpider  # type: ignore
+        return ScrewfixSpider
     except Exception:
         return None
 
@@ -83,7 +83,6 @@ def _make_process() -> CrawlerProcess:
     settings = get_project_settings()
     settings.set("ITEM_PIPELINES", {}, priority="cmdline")
     settings.set("EXTENSIONS", {"scrapy.extensions.telnet.TelnetConsole": None}, priority="cmdline")
-    settings.set("CLOSESPIDER_ITEMCOUNT", 60, priority="cmdline")
     settings.set("DOWNLOAD_DELAY", 1, priority="cmdline")
     settings.set("CONCURRENT_REQUESTS_PER_DOMAIN", 1, priority="cmdline")
     return CrawlerProcess(settings=settings)

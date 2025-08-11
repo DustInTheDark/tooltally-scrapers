@@ -83,7 +83,6 @@ def _make_process() -> CrawlerProcess:
     settings = get_project_settings()
     settings.set("ITEM_PIPELINES", {}, priority="cmdline")
     settings.set("EXTENSIONS", {"scrapy.extensions.telnet.TelnetConsole": None}, priority="cmdline")
-    settings.set("CLOSESPIDER_ITEMCOUNT", 60, priority="cmdline")
     settings.set("DOWNLOAD_DELAY", 1, priority="cmdline")
     settings.set("CONCURRENT_REQUESTS_PER_DOMAIN", 1, priority="cmdline")
     return CrawlerProcess(settings=settings)
