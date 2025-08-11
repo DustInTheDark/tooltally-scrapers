@@ -1,272 +1,172 @@
 # scripts/resolver.py
-import hashlib
-import json
 import re
 import sqlite3
-from datetime import datetime
-from typing import Optional, Tuple
+from pathlib import Path
+from typing import Optional
 
-# Try to use your project's connection helper if it exists.
-try:
-    from data.db import get_conn  # type: ignore
-except Exception:
-    # Fallback: local get_conn using data/tooltally.db
-    import os
-    def get_conn():
-        db_path = os.environ.get(
-            "DB_PATH",
-            os.path.join(os.path.dirname(__file__), "..", "data", "tooltally.db")
-        )
-        conn = sqlite3.connect(db_path, detect_types=sqlite3.PARSE_DECLTYPES)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON;")
-        return conn
+DB_PATH = Path(__file__).resolve().parents[1] / "data" / "tooltally.db"
 
-# --------- heuristics / parsing helpers ---------
+ENSURE_SQL = """
+PRAGMA foreign_keys = ON;
 
-KNOWN_BRANDS = [
-    "Bosch", "Makita", "DeWalt", "BLACK + DECKER", "Black & Decker", "Batavia",
-    "Milwaukee", "Ryobi", "Einhell", "Hitachi", "Hikoki", "Metabo", "Stanley"
-]
+CREATE TABLE IF NOT EXISTS vendors (
+  id   INTEGER PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE
+);
 
-MPN_PATTERNS = [
-    r"\b0?\d{2}[A-Z0-9]{1,}[A-Z0-9-]{3,}\b",   # Bosch-like: 06019H4000 etc.
-    r"\b[A-Z]{2,}\d[A-Z0-9-]{2,}\b",           # DCD796P1, GSB18V55, etc.
-    r"\b[0-9]{6,}[A-Z0-9-]*\b",                # numeric-heavy SKUs
-]
+CREATE TABLE IF NOT EXISTS products (
+  id       INTEGER PRIMARY KEY,
+  name     TEXT NOT NULL,
+  category TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_products_unique
+  ON products(name, COALESCE(category, ''));
 
-EAN_PATTERNS = [r"\b\d{13}\b"]
+CREATE TABLE IF NOT EXISTS offers (
+  id           INTEGER PRIMARY KEY,
+  product_id   INTEGER NOT NULL,
+  vendor_id    INTEGER NOT NULL,
+  price_pounds REAL    NOT NULL,
+  url          TEXT    NOT NULL,
+  vendor_sku   TEXT,
+  scraped_at   TEXT,
+  UNIQUE(product_id, vendor_id, url) ON CONFLICT REPLACE,
+  FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE,
+  FOREIGN KEY(vendor_id)  REFERENCES vendors(id)  ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_offers_product ON offers(product_id);
+CREATE INDEX IF NOT EXISTS idx_offers_vendor  ON offers(vendor_id);
 
-def norm_space(s: str) -> str:
-    return re.sub(r"\s+", " ", s or "").strip()
+CREATE TABLE IF NOT EXISTS raw_offers (
+  id            INTEGER PRIMARY KEY,
+  vendor        TEXT    NOT NULL,
+  title         TEXT    NOT NULL,
+  price_pounds  REAL    NOT NULL,
+  url           TEXT    NOT NULL,
+  vendor_sku    TEXT,
+  category_name TEXT,
+  scraped_at    TEXT,
+  processed     INTEGER NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_raw_unique ON raw_offers(vendor, url);
+CREATE INDEX IF NOT EXISTS idx_raw_processed ON raw_offers(processed);
+"""
 
-def detect_brand(title: str) -> Optional[str]:
-    t = title.lower()
-    for b in KNOWN_BRANDS:
-        if b.lower() in t:
-            return b
-    return None
+def _norm_space(s: str) -> str:
+    return re.sub(r"\s+", " ", s).strip()
 
-def find_first(patterns, text) -> Optional[str]:
-    for pat in patterns:
-        m = re.search(pat, text, re.I)
-        if m:
-            return m.group(0)
-    return None
+def _norm_category(cat: Optional[str]) -> Optional[str]:
+    if not cat:
+        return None
+    c = _norm_space(cat)
+    return c if c else None
 
-def parse_voltage(title: str) -> Optional[str]:
-    m = re.search(r"\b(10\.8|12|14\.4|18|20|24|36|40)\s*v\b", title, re.I)
-    return (m.group(1) + "V") if m else None
-
-def parse_battery_info(title: str) -> Tuple[bool, Optional[int], Optional[float]]:
-    t = title.lower()
-    if "bare" in t or "body only" in t or "bare unit" in t:
-        return (False, None, None)
-    qty = None
-    cap = None
-    m_qty = re.search(r"\b(\d+)\s*x\b", t)
-    if m_qty:
-        qty = int(m_qty.group(1))
-    m_cap = re.search(r"\b(\d+(?:\.\d+)?)\s*ah\b", t)
-    if m_cap:
-        cap = float(m_cap.group(1))
-    includes = ("battery" in t or "batteries" in t or "ah" in t) and "bare" not in t
-    return (includes, qty, cap)
-
-def variant_signature_from_title(title: str) -> str:
-    vol = parse_voltage(title) or ""
-    inc, qty, cap = parse_battery_info(title)
-    if not inc:
-        variant = "bare"
-    elif qty and cap:
-        variant = f"kit-{qty}x{cap}Ah"
-    elif qty:
-        variant = f"kit-{qty}x"
-    elif cap:
-        variant = f"kit-?x{cap}Ah"
-    else:
-        variant = "kit"
-    parts = [p for p in [vol, variant] if p]
-    return "|".join(parts) if parts else "base"
-
-def normalized_key(ean: Optional[str], brand: Optional[str], mpn: Optional[str], variant_sig: str) -> str:
-    if ean:
-        return f"ean:{ean}"
-    basis = norm_space(f"{brand or ''}|{mpn or ''}|{variant_sig or 'base'}").lower()
-    return "sig:" + hashlib.sha1(basis.encode("utf-8")).hexdigest()
-
-# --------- upserts ---------
-
-def upsert_vendor(conn, name: str) -> int:
-    name = norm_space(name)
-    cur = conn.execute("SELECT id FROM vendors WHERE name = ?;", (name,))
+def _get_or_create_vendor_id(cur: sqlite3.Cursor, name: str) -> int:
+    cur.execute("SELECT id FROM vendors WHERE name = ?", (name,))
     row = cur.fetchone()
     if row:
-        return row["id"]
-    conn.execute("INSERT INTO vendors (name) VALUES (?);", (name,))
-    return conn.execute("SELECT last_insert_rowid() AS id;").fetchone()["id"]
+        return row[0]
+    cur.execute("INSERT INTO vendors(name) VALUES (?)", (name,))
+    return cur.lastrowid
 
-def upsert_category(conn, name: Optional[str]) -> Optional[int]:
-    if not name:
-        return None
-    name = norm_space(name)
-    row = conn.execute("SELECT id FROM categories WHERE name = ?;", (name,)).fetchone()
-    if row:
-        return row["id"]
-    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
-    conn.execute("INSERT INTO categories (name, slug) VALUES (?, ?);", (name, slug))
-    return conn.execute("SELECT last_insert_rowid() AS id;").fetchone()["id"]
-
-def upsert_product(conn, brand: str, mpn: Optional[str], ean: Optional[str],
-                   name: str, category_id: Optional[int], variant_sig: str,
-                   normalized: str, specs: dict) -> int:
-    row = conn.execute("SELECT id FROM products WHERE normalized_key = ?;", (normalized,)).fetchone()
-    if row:
-        pid = row["id"]
-        conn.execute(
-            """UPDATE products
-               SET brand=?, mpn=?, ean=COALESCE(?, ean), name=?, category_id=?, variant_signature=?,
-                   specs_json=?, updated_at=CURRENT_TIMESTAMP
-               WHERE id=?;""",
-            (brand, mpn, ean, name, category_id, variant_sig, json.dumps(specs or {}), pid)
-        )
-        return pid
-
-    if ean:
-        row = conn.execute("SELECT id FROM products WHERE ean = ?;", (ean,)).fetchone()
+def _get_or_create_product_id(cur: sqlite3.Cursor, name: str, category: Optional[str]) -> int:
+    if category is None:
+        cur.execute("SELECT id FROM products WHERE name = ? AND category IS NULL", (name,))
+        row = cur.fetchone()
         if row:
-            pid = row["id"]
-            conn.execute(
-                """UPDATE products
-                   SET normalized_key=?, brand=?, mpn=?, name=?, category_id=?, variant_signature=?,
-                       specs_json=?, updated_at=CURRENT_TIMESTAMP
-                   WHERE id=?;""",
-                (normalized, brand, mpn, name, category_id, variant_sig, json.dumps(specs or {}), pid)
-            )
-            return pid
-
-    conn.execute(
-        """INSERT INTO products
-           (brand, mpn, ean, name, category_id, variant_signature, normalized_key, specs_json)
-           VALUES (?,?,?,?,?,?,?,?);""",
-        (brand, mpn, ean, name, category_id, variant_sig, normalized, json.dumps(specs or {}))
-    )
-    return conn.execute("SELECT last_insert_rowid() AS id;").fetchone()["id"]
-
-def upsert_offer(conn, product_id: int, vendor_id: int, vendor_sku: Optional[str],
-                 price_cents: int, currency: str, buy_url: str,
-                 in_stock: Optional[int], shipping_cents: Optional[int],
-                 scraped_at: str):
-    if vendor_sku:
-        conn.execute(
-            """
-            INSERT INTO offers (product_id, vendor_id, vendor_sku, price_cents, currency, buy_url, in_stock, shipping_cents, scraped_at)
-            VALUES (?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(vendor_id, vendor_sku) DO UPDATE SET
-              product_id=excluded.product_id,
-              price_cents=excluded.price_cents,
-              currency=excluded.currency,
-              buy_url=excluded.buy_url,
-              in_stock=excluded.in_stock,
-              shipping_cents=excluded.shipping_cents,
-              scraped_at=excluded.scraped_at;
-            """,
-            (product_id, vendor_id, vendor_sku, price_cents, currency, buy_url, in_stock, shipping_cents, scraped_at)
-        )
+            return row[0]
+        cur.execute("INSERT INTO products(name, category) VALUES (?, NULL)", (name,))
+        return cur.lastrowid
     else:
-        # Fallback uniqueness by (vendor_id, buy_url)
-        row = conn.execute("SELECT id FROM offers WHERE vendor_id=? AND buy_url=?;", (vendor_id, buy_url)).fetchone()
+        cur.execute("SELECT id FROM products WHERE name = ? AND category = ?", (name, category))
+        row = cur.fetchone()
         if row:
-            conn.execute(
-                """UPDATE offers
-                   SET product_id=?, price_cents=?, currency=?, in_stock=?, shipping_cents=?, scraped_at=?
-                   WHERE id=?;""",
-                (product_id, price_cents, currency, in_stock, shipping_cents, scraped_at, row["id"])
-            )
-        else:
-            conn.execute(
-                """INSERT INTO offers
-                   (product_id, vendor_id, vendor_sku, price_cents, currency, buy_url, in_stock, shipping_cents, scraped_at)
-                   VALUES (?,?,?,?,?,?,?,?,?);""",
-                (product_id, vendor_id, vendor_sku, price_cents, currency, buy_url, in_stock, shipping_cents, scraped_at)
-            )
+            return row[0]
+        cur.execute("INSERT INTO products(name, category) VALUES (?, ?)", (name, category))
+        return cur.lastrowid
 
-# --------- main resolution pipeline ---------
-
-def resolve_one(conn, ro):
-    raw_title = ro["raw_title"]
-    vendor = ro["vendor"]
-    price_cents = int(ro["price_cents"])
-    currency = ro["currency"] or "GBP"
-    buy_url = ro["buy_url"]
-    vendor_sku = ro["vendor_sku"]
-    category_name = ro["category_name"]
-    scraped_at = ro["scraped_at"] or datetime.utcnow().isoformat()
-
-    brand = detect_brand(raw_title) or "Unknown"
-    ean = find_first(EAN_PATTERNS, raw_title)
-    mpn = find_first(MPN_PATTERNS, raw_title)
-    variant_sig = variant_signature_from_title(raw_title)
-
-    cat_id = upsert_category(conn, category_name)
-    nkey = normalized_key(ean, brand, mpn, variant_sig)
-
-    specs = {
-        "voltage": parse_voltage(raw_title),
-        "battery_variant": variant_sig,
-    }
-
-    product_id = upsert_product(
-        conn,
-        brand=brand,
-        mpn=mpn,
-        ean=ean,
-        name=norm_space(raw_title),  # you can later replace with a cleaner canonical title
-        category_id=cat_id,
-        variant_sig=variant_sig,
-        normalized=nkey,
-        specs=specs
-    )
-
-    vendor_id = upsert_vendor(conn, vendor)
-    upsert_offer(
-        conn,
-        product_id=product_id,
-        vendor_id=vendor_id,
-        vendor_sku=vendor_sku,
-        price_cents=price_cents,
-        currency=currency,
-        buy_url=buy_url,
-        in_stock=None,
-        shipping_cents=None,
-        scraped_at=scraped_at
-    )
-
-    # Alias for auditability / future fuzzy matches
-    conn.execute(
-        "INSERT OR IGNORE INTO product_aliases (product_id, alias_name, source_vendor_id, confidence) VALUES (?,?,?,?);",
-        (product_id, raw_title, vendor_id, 0.6 if (mpn or ean) else 0.4)
-    )
-
-    conn.execute(
-        "UPDATE raw_offers SET processed=1, resolved_product_id=? WHERE id=?;",
-        (product_id, ro["id"])
-    )
-
-def process_unresolved(batch_size: int = 2000) -> int:
-    conn = get_conn()
+def resolve_batch(limit: int = 1000) -> tuple[int, int, int]:
+    con = sqlite3.connect(DB_PATH)
+    con.execute("PRAGMA foreign_keys = ON;")
     try:
-        rows = conn.execute(
-            "SELECT * FROM raw_offers WHERE processed=0 ORDER BY id LIMIT ?;",
-            (batch_size,)
-        ).fetchall()
-        for ro in rows:
-            resolve_one(conn, ro)
-        conn.commit()
-        return len(rows)
+        con.executescript(ENSURE_SQL)
+        cur = con.cursor()
+
+        cur.execute("""
+            SELECT id, vendor, title, price_pounds, url, vendor_sku, category_name, scraped_at
+            FROM raw_offers
+            WHERE processed = 0
+            ORDER BY id
+            LIMIT ?
+        """, (limit,))
+        rows = cur.fetchall()
+        if not rows:
+            return (0, 0, 0)
+
+        vendors_created = 0
+        products_created = 0
+        offers_upserted = 0
+
+        for (raw_id, vendor, title, price, url, vendor_sku, category_name, scraped_at) in rows:
+            vendor = _norm_space(vendor)
+            title_norm = _norm_space(title)
+            category_norm = _norm_category(category_name)
+
+            # vendors
+            cur.execute("SELECT id FROM vendors WHERE name = ?", (vendor,))
+            vrow = cur.fetchone()
+            if vrow:
+                vendor_id = vrow[0]
+            else:
+                cur.execute("INSERT INTO vendors(name) VALUES (?)", (vendor,))
+                vendor_id = cur.lastrowid
+                vendors_created += 1
+
+            # products
+            if category_norm is None:
+                cur.execute("SELECT id FROM products WHERE name = ? AND category IS NULL", (title_norm,))
+                prow = cur.fetchone()
+                if prow:
+                    product_id = prow[0]
+                else:
+                    cur.execute("INSERT INTO products(name, category) VALUES (?, NULL)", (title_norm,))
+                    product_id = cur.lastrowid
+                    products_created += 1
+            else:
+                cur.execute("SELECT id FROM products WHERE name = ? AND category = ?", (title_norm, category_norm))
+                prow = cur.fetchone()
+                if prow:
+                    product_id = prow[0]
+                else:
+                    cur.execute("INSERT INTO products(name, category) VALUES (?, ?)", (title_norm, category_norm))
+                    product_id = cur.lastrowid
+                    products_created += 1
+
+            # offers (UPSERT by product_id + vendor_id + url)
+            cur.execute("""
+                INSERT INTO offers(product_id, vendor_id, price_pounds, url, vendor_sku, scraped_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(product_id, vendor_id, url) DO UPDATE SET
+                  price_pounds = excluded.price_pounds,
+                  vendor_sku   = COALESCE(excluded.vendor_sku, offers.vendor_sku),
+                  scraped_at   = excluded.scraped_at
+            """, (product_id, vendor_id, price, url, vendor_sku, scraped_at))
+            offers_upserted += 1
+
+            # mark raw row processed
+            cur.execute("UPDATE raw_offers SET processed = 1 WHERE id = ?", (raw_id,))
+
+        con.commit()
+        return (vendors_created, products_created, offers_upserted)
     finally:
-        conn.close()
+        con.close()
 
 if __name__ == "__main__":
-    n = process_unresolved(5000)
-    print(f"Resolved {n} raw rows.")
+    total_offers = 0
+    while True:
+        v, p, o = resolve_batch(2000)
+        total_offers += o
+        print(f"Batch: vendors+{v}, products+{p}, offers upserted {o}")
+        if o == 0:
+            break
+    print(f"Done. Total offers upserted: {total_offers}")

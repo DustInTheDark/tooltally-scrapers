@@ -6,6 +6,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import re
+from urllib.parse import urlparse, unquote
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -19,7 +20,6 @@ from scripts.raw_offers_writer import save_many_raw_offers
 VENDOR = "Toolstation"
 SPIDER_NAME = "toolstation"
 
-
 def _parse_price_to_float(v: Any) -> Optional[float]:
     if v is None:
         return None
@@ -32,6 +32,16 @@ def _parse_price_to_float(v: Any) -> Optional[float]:
     except ValueError:
         return None
 
+def _title_from_url(url: str) -> Optional[str]:
+    try:
+        path = unquote(urlparse(url).path or "")
+        seg = path.rstrip("/").rsplit("/", 1)[-1]
+        seg = seg.split("?")[0].split("#")[0]
+        seg = seg.split("/p")[0]     # Toolstation often ends with /p12345
+        text = seg.replace("-", " ").replace("_", " ").strip()
+        return text or None
+    except Exception:
+        return None
 
 def _norm_item(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     title = item.get("title") or item.get("name") or item.get("raw_title")
@@ -40,8 +50,14 @@ def _norm_item(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     category = item.get("category") or item.get("category_name")
     price = item.get("price_gbp") or item.get("price_pounds") or item.get("price") or item.get("current_price") or item.get("amount")
     price_gbp = _parse_price_to_float(price)
+
+    # Fallback: derive title from URL slug if missing
+    if (not title) and url:
+        title = _title_from_url(url)
+
     if not title or not url or price_gbp is None:
         return None
+
     return {
         "vendor": VENDOR,
         "title": str(title),
@@ -52,7 +68,6 @@ def _norm_item(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "scraped_at": datetime.utcnow().isoformat(),
     }
 
-
 def _try_import_spider_class():
     try:
         from tooltally.spiders.toolstation import ToolstationSpider  # type: ignore
@@ -60,17 +75,17 @@ def _try_import_spider_class():
     except Exception:
         return None
 
-
 def _make_process() -> CrawlerProcess:
     settings = get_project_settings()
+    # Disable project pipelines & Telnet; we persist via raw_offers ourselves
     settings.set("ITEM_PIPELINES", {}, priority="cmdline")
     settings.set("EXTENSIONS", {"scrapy.extensions.telnet.TelnetConsole": None}, priority="cmdline")
+    # Optional: cap items while testing
+    # settings.set("CLOSESPIDER_ITEMCOUNT", 100, priority="cmdline")
     return CrawlerProcess(settings=settings)
-
 
 def run() -> None:
     process = _make_process()
-
     rows: List[Dict[str, Any]] = []
     seen: set[Tuple[str, Optional[str]]] = set()
 
@@ -101,7 +116,6 @@ def run() -> None:
         print(f"[{VENDOR}] inserted {inserted} raw offers")
     else:
         print(f"[{VENDOR}] no rows scraped; nothing inserted.")
-
 
 if __name__ == "__main__":
     run()
