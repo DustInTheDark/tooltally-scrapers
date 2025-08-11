@@ -12,18 +12,17 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from scrapy import signals
+from pydispatch import dispatcher
 from scrapy.crawler import CrawlerProcess
 from scrapy.utils.project import get_project_settings
 
 from scripts.raw_offers_writer import save_many_raw_offers
-
 
 VENDOR = "UK Planet Tools"
 SPIDER_NAME = "ukplanettools"
 
 
 def _parse_price_to_float(v: Any) -> Optional[float]:
-    """Accepts numbers like 149.99 or strings like '£149.99' and returns float pounds."""
     if v is None:
         return None
     if isinstance(v, (int, float)):
@@ -42,7 +41,6 @@ def _parse_price_to_float(v: Any) -> Optional[float]:
 
 
 def _norm_item(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Map a Scrapy item/dict to our staging shape; None = skip."""
     title = item.get("title") or item.get("name") or item.get("raw_title")
     url = item.get("url") or item.get("product_url") or item.get("link")
     sku = item.get("sku") or item.get("vendor_sku") or item.get("mpn") or item.get("model")
@@ -57,7 +55,6 @@ def _norm_item(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     )
     price_gbp = _parse_price_to_float(price)
 
-    # minimal required fields
     if not title or not url or price_gbp is None:
         return None
 
@@ -73,7 +70,6 @@ def _norm_item(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 def _try_import_spider_class():
-    """Fallback import if spider name isn't registered in the project."""
     try:
         from tooltally.spiders.ukplanettools import UKPlanetToolsSpider  # type: ignore
         return UKPlanetToolsSpider
@@ -81,9 +77,15 @@ def _try_import_spider_class():
         return None
 
 
-def run() -> None:
+def _make_process() -> CrawlerProcess:
     settings = get_project_settings()
-    process = CrawlerProcess(settings=settings)
+    settings.set("ITEM_PIPELINES", {}, priority="cmdline")
+    settings.set("EXTENSIONS", {"scrapy.extensions.telnet.TelnetConsole": None}, priority="cmdline")
+    return CrawlerProcess(settings=settings)
+
+
+def run() -> None:
+    process = _make_process()
 
     rows: List[Dict[str, Any]] = []
     seen: set[Tuple[str, Optional[str]]] = set()  # (url, sku) dedupe per run
@@ -98,22 +100,17 @@ def run() -> None:
         seen.add(key)
         rows.append(norm)
 
-    # Hook signal before starting
-    process.signals.connect(on_item_scraped, signal=signals.item_scraped)
+    dispatcher.connect(on_item_scraped, signal=signals.item_scraped)
 
-    # Prefer crawling by spider name
     try:
         process.crawl(SPIDER_NAME)
     except KeyError:
-        # Fallback to importing a spider class
         spider_cls = _try_import_spider_class()
         if not spider_cls:
-            raise RuntimeError(
-                f"Could not find Scrapy spider '{SPIDER_NAME}' or import fallback class."
-            )
+            raise RuntimeError(f"Could not find Scrapy spider '{SPIDER_NAME}' or import fallback class.")
         process.crawl(spider_cls)
 
-    process.start()  # blocks until finished
+    process.start()
 
     if rows:
         inserted = save_many_raw_offers(rows)

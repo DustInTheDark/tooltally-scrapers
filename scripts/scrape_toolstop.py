@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from scrapy import signals
+from pydispatch import dispatcher
 from scrapy.crawler import CrawlerProcess
 from scrapy.utils.project import get_project_settings
 
@@ -17,6 +18,7 @@ from scripts.raw_offers_writer import save_many_raw_offers
 
 VENDOR = "Toolstop"
 SPIDER_NAME = "toolstop"
+
 
 def _parse_price_to_float(v: Any) -> Optional[float]:
     if v is None:
@@ -29,6 +31,7 @@ def _parse_price_to_float(v: Any) -> Optional[float]:
         return float(m.group(1)) if m else None
     except ValueError:
         return None
+
 
 def _norm_item(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     title = item.get("title") or item.get("name") or item.get("raw_title")
@@ -49,6 +52,7 @@ def _norm_item(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "scraped_at": datetime.utcnow().isoformat(),
     }
 
+
 def _try_import_spider_class():
     try:
         from tooltally.spiders.toolstop import ToolstopSpider  # type: ignore
@@ -56,9 +60,16 @@ def _try_import_spider_class():
     except Exception:
         return None
 
-def run() -> None:
+
+def _make_process() -> CrawlerProcess:
     settings = get_project_settings()
-    process = CrawlerProcess(settings=settings)
+    settings.set("ITEM_PIPELINES", {}, priority="cmdline")
+    settings.set("EXTENSIONS", {"scrapy.extensions.telnet.TelnetConsole": None}, priority="cmdline")
+    return CrawlerProcess(settings=settings)
+
+
+def run() -> None:
+    process = _make_process()
 
     rows: List[Dict[str, Any]] = []
     seen: set[Tuple[str, Optional[str]]] = set()
@@ -73,7 +84,7 @@ def run() -> None:
         seen.add(key)
         rows.append(norm)
 
-    process.signals.connect(on_item_scraped, signal=signals.item_scraped)
+    dispatcher.connect(on_item_scraped, signal=signals.item_scraped)
 
     try:
         process.crawl(SPIDER_NAME)
@@ -90,6 +101,7 @@ def run() -> None:
         print(f"[{VENDOR}] inserted {inserted} raw offers")
     else:
         print(f"[{VENDOR}] no rows scraped; nothing inserted.")
+
 
 if __name__ == "__main__":
     run()

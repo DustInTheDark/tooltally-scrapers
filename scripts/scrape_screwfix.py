@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from scrapy import signals
+from pydispatch import dispatcher
 from scrapy.crawler import CrawlerProcess
 from scrapy.utils.project import get_project_settings
 
@@ -19,6 +20,7 @@ from scripts.raw_offers_writer import save_many_raw_offers
 
 VENDOR = "Screwfix"
 SPIDER_NAME = "screwfix"  # prefer to run by name
+
 
 def _parse_price_to_float(v: Any) -> Optional[float]:
     if v is None:
@@ -37,6 +39,7 @@ def _parse_price_to_float(v: Any) -> Optional[float]:
     except ValueError:
         return None
 
+
 def _norm_item(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     title = item.get("title") or item.get("name") or item.get("raw_title")
     url = item.get("url") or item.get("product_url") or item.get("link")
@@ -51,6 +54,7 @@ def _norm_item(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         or item.get("amount")
     )
     price_gbp = _parse_price_to_float(price)
+
     if not title or not url or price_gbp is None:
         return None
 
@@ -64,6 +68,7 @@ def _norm_item(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "scraped_at": datetime.utcnow().isoformat(),
     }
 
+
 def _try_import_spider_class():
     try:
         from tooltally.spiders.screwfix import ScrewfixSpider  # type: ignore
@@ -71,12 +76,20 @@ def _try_import_spider_class():
     except Exception:
         return None
 
-def run() -> None:
+
+def _make_process() -> CrawlerProcess:
     settings = get_project_settings()
-    process = CrawlerProcess(settings=settings)
+    # Disable project pipelines & telnet; we persist via raw_offers ourselves
+    settings.set("ITEM_PIPELINES", {}, priority="cmdline")
+    settings.set("EXTENSIONS", {"scrapy.extensions.telnet.TelnetConsole": None}, priority="cmdline")
+    return CrawlerProcess(settings=settings)
+
+
+def run() -> None:
+    process = _make_process()
 
     rows: List[Dict[str, Any]] = []
-    seen: set[Tuple[str, Optional[str]]] = set()
+    seen: set[Tuple[str, Optional[str]]] = set()  # (url, sku) dedupe per run
 
     def on_item_scraped(item, response, spider):
         norm = _norm_item(dict(item))
@@ -88,14 +101,14 @@ def run() -> None:
         seen.add(key)
         rows.append(norm)
 
-    process.signals.connect(on_item_scraped, signal=signals.item_scraped)
+    dispatcher.connect(on_item_scraped, signal=signals.item_scraped)
 
     try:
         process.crawl(SPIDER_NAME)
     except KeyError:
         spider_cls = _try_import_spider_class()
         if not spider_cls:
-            raise RuntimeError(f"Could not find spider '{SPIDER_NAME}' or import fallback class.")
+            raise RuntimeError(f"Could not find Scrapy spider '{SPIDER_NAME}' or import fallback class.")
         process.crawl(spider_cls)
 
     process.start()
@@ -105,6 +118,7 @@ def run() -> None:
         print(f"[{VENDOR}] inserted {inserted} raw offers")
     else:
         print(f"[{VENDOR}] no rows scraped; nothing inserted.")
+
 
 if __name__ == "__main__":
     run()
