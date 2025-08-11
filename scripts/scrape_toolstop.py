@@ -6,7 +6,8 @@ if __package__ in (None, ""):
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import re
-from datetime import datetime
+from urllib.parse import urlparse, unquote
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from scrapy import signals
@@ -24,12 +25,24 @@ def _parse_price_to_float(v: Any) -> Optional[float]:
     if v is None:
         return None
     if isinstance(v, (int, float)):
-        f = float(v); return f if f >= 0 else None
+        f = float(v)
+        return f if f >= 0 else None
     s = str(v).strip()
     m = re.search(r"([0-9]+(?:[.,][0-9]{1,2})?)", s.replace(",", ""))
     try:
         return float(m.group(1)) if m else None
     except ValueError:
+        return None
+
+
+def _title_from_url(url: str) -> Optional[str]:
+    try:
+        path = unquote(urlparse(url).path or "")
+        seg = path.rstrip("/").rsplit("/", 1)[-1]
+        seg = seg.split("?")[0].split("#")[0]
+        text = seg.replace("-", " ").replace("_", " ").strip()
+        return text or None
+    except Exception:
         return None
 
 
@@ -40,8 +53,13 @@ def _norm_item(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     category = item.get("category") or item.get("category_name")
     price = item.get("price_gbp") or item.get("price_pounds") or item.get("price") or item.get("current_price") or item.get("amount")
     price_gbp = _parse_price_to_float(price)
+
+    if (not title) and url:
+        title = _title_from_url(url)
+
     if not title or not url or price_gbp is None:
         return None
+
     return {
         "vendor": VENDOR,
         "title": str(title),
@@ -49,7 +67,7 @@ def _norm_item(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "url": str(url),
         "vendor_sku": (str(sku) if sku else None),
         "category_name": (str(category) if category else None),
-        "scraped_at": datetime.utcnow().isoformat(),
+        "scraped_at": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -65,6 +83,9 @@ def _make_process() -> CrawlerProcess:
     settings = get_project_settings()
     settings.set("ITEM_PIPELINES", {}, priority="cmdline")
     settings.set("EXTENSIONS", {"scrapy.extensions.telnet.TelnetConsole": None}, priority="cmdline")
+    settings.set("CLOSESPIDER_ITEMCOUNT", 60, priority="cmdline")
+    settings.set("DOWNLOAD_DELAY", 1, priority="cmdline")
+    settings.set("CONCURRENT_REQUESTS_PER_DOMAIN", 1, priority="cmdline")
     return CrawlerProcess(settings=settings)
 
 
