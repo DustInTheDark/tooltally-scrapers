@@ -45,18 +45,22 @@ def _parse_int(value: str | None, default: int) -> int:
 
 def _build_search_filters(term: str | None) -> Tuple[str, List[str]]:
     """
-    Tokenized LIKE search on products.name; all tokens must match (AND).
+    Tokenized LIKE search; each token must match EITHER product name OR category.
+    ( (name LIKE ? OR category LIKE ?) AND (name LIKE ? OR category LIKE ?) ... )
     """
     if not term:
         return "", []
     tokens = [t.strip() for t in term.split() if t.strip()]
     if not tokens:
         return "", []
-    clauses, params = [], []
+
+    parts: List[str] = []
+    params: List[str] = []
     for t in tokens:
-        clauses.append("LOWER(p.name) LIKE ?")
-        params.append(f"%{t.lower()}%")
-    return " AND ".join(clauses), params
+        parts.append("(LOWER(p.name) LIKE ? OR LOWER(IFNULL(p.category,'')) LIKE ?)")
+        needle = f"%{t.lower()}%"
+        params.extend([needle, needle])
+    return " AND ".join(parts), params
 
 # ---------- Routes ----------
 @app.route("/health")
@@ -92,6 +96,7 @@ def list_products():
         params.extend(sp)
 
     if category:
+        # exact match on category; could be changed to case-insensitive if needed
         where_parts.append("(p.category = ?)")
         params.append(category)
 
