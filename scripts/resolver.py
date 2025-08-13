@@ -1,16 +1,4 @@
 # scripts/resolver.py
-"""
-Enhanced resolver for ToolTally:
-- Reads new/changed rows from raw_offers
-- Builds a robust fingerprint per product (EAN/GTIN > brand+model+voltage+kit+category)
-- Groups offers from multiple vendors into one canonical product
-- Upserts products and offers without breaking existing logic
-- Marks processed rows when done
-
-Backwards-compatible with existing DB; works with optional extra columns
-from migration script.
-"""
-
 import os
 import re
 import sqlite3
@@ -19,7 +7,7 @@ from datetime import datetime
 DB_PATH = os.environ.get("DB_PATH") or os.path.join(os.path.dirname(__file__), "..", "data", "tooltally.db")
 DB_PATH = os.path.abspath(DB_PATH)
 
-# --- Heuristics for parsing ---------------------------------------------------
+# ----------------- Helpers: normalize & token extraction ----------------------
 
 BRANDS = r"(makita|dewalt|bosch|milwaukee|einhell|ryobi|black\+?decker|hikoki|stanley|metabo|titan|parkside)"
 MODEL_PATTERNS = [
@@ -28,6 +16,7 @@ MODEL_PATTERNS = [
     r"\b(\d{3,4}[A-Z]{1,2})\b",
 ]
 VOLT_RE = r"(10\.8|10v|12v|14\.4|18v|20v|36v|40v|max|110v|115v|220v|230v|240v)"
+
 KIT_PATTERNS = [
     ("bare", r"\b(bare unit|body only|tool only)\b"),
     ("1x1.5Ah", r"\b1\s*x\s*1\.?5\s*ah\b"),
@@ -37,11 +26,42 @@ KIT_PATTERNS = [
     ("2x5Ah", r"\b2\s*x\s*5\s*ah\b"),
 ]
 
+SUBTOKENS = [
+    # hammers
+    "claw", "framing", "ball", "ball pein", "ball-pein", "club", "lump", "sledge", "deadblow", "dead-blow",
+    # handsaws
+    "handsaw", "panel", "tenon", "rip", "bow", "hacksaw", "junior", "coping",
+]
+
+CAT_MAP = {
+    "hammer": "hammer", "hammers": "hammer",
+    "saw": "saw", "saws": "saw", "hand saw": "saw", "handsaw": "saw", "hacksaw": "saw",
+    "drill": "drill", "drills": "drill", "drill driver": "drill", "drill drivers": "drill",
+}
+
+SIZE_PATTERNS = [
+    (r"\b(\d+)\s*oz\b", lambda m: f"oz{m.group(1)}"),
+    (r"\b(\d+)\s*g\b", lambda m: f"g{m.group(1)}"),
+    (r"\b(\d+)\s*mm\b", lambda m: f"mm{m.group(1)}"),
+    (r"\b(\d+)\s*cm\b", lambda m: f"cm{m.group(1)}"),
+    (r"\b(\d+)\s*in(ch)?\b", lambda m: f"in{m.group(1)}"),
+    (r"\b(\d+)\s*tpi\b", lambda m: f"tpi{m.group(1)}"),
+]
+
+STOPWORDS = {
+    "unit", "bare", "body", "only", "kit", "set", "refurb", "electric", "corded", "cordless", "combi",
+    "plus", "brushless", "li-ion", "lithium", "max", "with", "and", "the", "tool",
+}
+
 def norm_space(s: str) -> str:
     return re.sub(r"[\s/_-]+", " ", (s or "")).strip()
 
 def norm_lower(s: str) -> str:
     return norm_space(s).lower()
+
+def base_category(cat: str) -> str:
+    c = norm_lower(cat)
+    return CAT_MAP.get(c, CAT_MAP.get(c.rstrip("s"), c))  # map plurals too
 
 def extract_brand(title: str) -> str:
     m = re.search(BRANDS, title or "", re.I)
@@ -60,9 +80,7 @@ def extract_voltage(title: str) -> int | None:
     m = re.search(VOLT_RE, t)
     if not m:
         return None
-    g = m.group(1).lower().replace("max", "")
-    g = g.replace("v", "")
-    g = g.replace("10.8", "12")
+    g = m.group(1).lower().replace("max", "").replace("v", "").replace("10.8", "12")
     try:
         return int(re.sub(r"\D", "", g))
     except Exception:
@@ -75,21 +93,59 @@ def extract_kit(title: str) -> str:
             return label
     return ""
 
+def extract_sizes(title: str) -> list[str]:
+    t = norm_lower(title)
+    out = set()
+    for pat, tokey in SIZE_PATTERNS:
+        for m in re.finditer(pat, t):
+            out.add(tokey(m))
+    return sorted(out)
+
+def extract_subtokens(title: str) -> list[str]:
+    t = norm_lower(title)
+    found = set()
+    for tok in SUBTOKENS:
+        if re.search(rf"\b{re.escape(tok)}\b", t):
+            # collapse variants like "ball pein" -> "ball-pein"
+            found.add(tok.replace(" ", "-"))
+    return sorted(found)
+
 def build_fingerprint(title: str, category: str, vendor_sku: str | None = None, ean_gtin: str | None = None) -> str:
     if ean_gtin:
         return f"ean:{ean_gtin}"
+
     brand = extract_brand(title)
     model = extract_model(title)
     volt = extract_voltage(title)
     kit = extract_kit(title)
-    cat = norm_lower(category or "")
-    parts = [brand, model, str(volt or ""), kit, cat]
-    key = " | ".join([p for p in parts if p])
-    if not key and vendor_sku:
-        key = f"sku:{norm_lower(vendor_sku)}"
-    return key
+    cat = base_category(category or "")
 
-# --- DB helpers ---------------------------------------------------------------
+    # Primary (power tools): brand + model + voltage + kit + category
+    if model or volt:
+        parts = [brand, model, str(volt or ""), kit, cat]
+        key = " | ".join([p for p in parts if p])
+        if key:
+            return key
+
+    # Fallback for hand tools (e.g., hammers/saws): brand + base cat + sizes + subtype
+    sizes = extract_sizes(title)
+    subs = extract_subtokens(title)
+    if brand or sizes or subs or cat:
+        parts = [brand, cat] + sizes + subs
+        key = " | ".join([p for p in parts if p])
+        if key:
+            return key
+
+    # Final fallback
+    if vendor_sku:
+        return f"sku:{norm_lower(vendor_sku)}"
+
+    # Last resort: heavily cleaned title tokens (digits + key words only)
+    tokens = [t for t in re.findall(r"[a-z0-9]+", norm_lower(title)) if t not in STOPWORDS]
+    key = " ".join(tokens[:8])
+    return f"title:{key}" if key else ""
+
+# ----------------------- DB helpers (unchanged behavior) ----------------------
 
 def dict_factory(cursor, row):
     return {col[0]: row[idx] for idx, col in enumerate(cursor.description)}
@@ -162,7 +218,7 @@ def insert_or_replace_offer(cur, product_id, vendor_id, price, url, vendor_sku, 
             VALUES(?, ?, ?, ?, ?, ?, ?)
         """, (product_id, vendor_id, price, url, vendor_sku, scraped_at, datetime.utcnow().isoformat() + "Z"))
 
-# --- Main ---------------------------------------------------------------------
+# --------------------------------- Main --------------------------------------
 
 def main():
     con = sqlite3.connect(DB_PATH)
@@ -170,17 +226,21 @@ def main():
     cur = con.cursor()
     cur.execute("PRAGMA journal_mode=WAL;")
     cur.execute("PRAGMA foreign_keys=ON;")
+
     try:
         cur.execute("SELECT * FROM raw_offers WHERE COALESCE(processed, 0) = 0")
         raw_rows = cur.fetchall()
     except sqlite3.OperationalError:
         cur.execute("SELECT * FROM raw_offers")
         raw_rows = cur.fetchall()
+
     if not raw_rows:
         print("No new raw_offers to process.")
         con.close()
         return
+
     print(f"Processing {len(raw_rows)} raw_offers rows…")
+
     batch = 0
     try:
         cur.execute("BEGIN;")
@@ -196,16 +256,20 @@ def main():
             vendor_sku = row.get("vendor_sku") or row.get("sku") or None
             ean_gtin = row.get("ean_gtin") or row.get("ean") or row.get("gtin") or None
             scraped_at = row.get("scraped_at") or datetime.utcnow().isoformat() + "Z"
+
             if price is None or url is None:
                 continue
+
             vendor_id = ensure_vendor_id(cur, row)
             if not vendor_id:
                 continue
+
             fp = build_fingerprint(title, category, vendor_sku, ean_gtin)
             brand = extract_brand(title)
             model = extract_model(title)
             voltage = extract_voltage(title)
             kit = extract_kit(title)
+
             pid = upsert_product(
                 cur,
                 name=norm_space(title),
@@ -217,6 +281,7 @@ def main():
                 kit=kit or None,
                 ean_gtin=ean_gtin or None,
             )
+
             insert_or_replace_offer(
                 cur,
                 product_id=pid,
@@ -226,12 +291,15 @@ def main():
                 vendor_sku=vendor_sku,
                 scraped_at=scraped_at,
             )
+
             if "processed" in row:
                 cur.execute("UPDATE raw_offers SET processed=1 WHERE id=?", (row["id"],))
+
             batch += 1
             if batch % 500 == 0:
                 con.commit()
                 cur.execute("BEGIN;")
+
         con.commit()
         print(f"Processed {batch} raw rows into canonical products/offers.")
     except Exception:
