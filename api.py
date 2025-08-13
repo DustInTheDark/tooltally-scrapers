@@ -1,195 +1,177 @@
-# api.py — ToolTally Backend API (Flask + SQLite)
-# Reads from canonical tables: products, offers, vendors
-# Env: DB_PATH (default: data/tooltally.db)
-
-from __future__ import annotations
-
+# tooltally-scrapers/api.py
 import os
 import sqlite3
-from typing import Any, Dict, List, Tuple
+from flask import Flask, request, jsonify, g
+from datetime import datetime
 
-from flask import Flask, g, jsonify, request
-
-DB_PATH = os.environ.get("DB_PATH", os.path.join("data", "tooltally.db"))
+DB_PATH = os.environ.get("DB_PATH") or os.path.join(os.path.dirname(__file__), "data", "tooltally.db")
+DB_PATH = os.path.abspath(DB_PATH)
 
 app = Flask(__name__)
 
-# ---------- DB helpers ----------
-def _dict_factory(cursor: sqlite3.Cursor, row: tuple[Any, ...]) -> Dict[str, Any]:
-    return {col[0]: row[idx] for idx, col in enumerate(cursor.description)}
+# -------------------- DB helpers --------------------
 
-def get_db() -> sqlite3.Connection:
-    db = getattr(g, "_db", None)
-    if db is None:
-        db = sqlite3.connect(DB_PATH)
-        db.row_factory = _dict_factory
-        db.execute("PRAGMA journal_mode=WAL;")
-        db.execute("PRAGMA synchronous=NORMAL;")
-        g._db = db
-    return db
+def get_db():
+    if "db" not in g:
+        g.db = sqlite3.connect(DB_PATH)
+        g.db.row_factory = sqlite3.Row
+        g.db.execute("PRAGMA foreign_keys=ON;")
+    return g.db
 
 @app.teardown_appcontext
-def close_db(exception=None):
-    db = getattr(g, "_db", None)
+def close_db(exc):
+    db = g.pop("db", None)
     if db is not None:
         db.close()
 
-# ---------- Utilities ----------
-def _parse_int(value: str | None, default: int) -> int:
-    if value is None:
-        return default
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
+def tokens_from_query(q: str):
+    return [t.strip() for t in (q or "").split() if t.strip()]
 
-def _build_search_filters(term: str | None) -> Tuple[str, List[str]]:
-    """
-    Tokenized LIKE search; each token must match EITHER product name OR category.
-    ( (name LIKE ? OR category LIKE ?) AND (name LIKE ? OR category LIKE ?) ... )
-    """
-    if not term:
-        return "", []
-    tokens = [t.strip() for t in term.split() if t.strip()]
-    if not tokens:
-        return "", []
+def build_filter_sql(tokens, category):
+    """Match semantics: each token must match name OR category (AND across tokens)."""
+    wheres = []
+    params = []
 
-    parts: List[str] = []
-    params: List[str] = []
+    # Constrain to products that HAVE offers by joining to offers-agg (done in queries)
+    # Tokens:
     for t in tokens:
-        parts.append("(LOWER(p.name) LIKE ? OR LOWER(IFNULL(p.category,'')) LIKE ?)")
-        needle = f"%{t.lower()}%"
-        params.extend([needle, needle])
-    return " AND ".join(parts), params
+        wheres.append("(LOWER(p.name) LIKE ? OR LOWER(p.category) LIKE ?)")
+        like = f"%{t.lower()}%"
+        params.extend([like, like])
 
-# ---------- Routes ----------
-@app.route("/health")
-def health():
-    try:
-        con = get_db()
-        con.execute("SELECT 1")
-        return jsonify({"ok": True})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-@app.route("/products", methods=["GET"])
-def list_products():
-    """
-    Returns unique products with min_price and vendors_count.
-    Supports: search (or q), category, page, limit.
-    Response: { items, total, page, limit }
-    """
-    con = get_db()
-    search = request.args.get("search") or request.args.get("q") or ""
-    category = (request.args.get("category") or "").strip()
-    page = _parse_int(request.args.get("page"), 1)
-    limit = _parse_int(request.args.get("limit"), 24)
-    if page < 1: page = 1
-    if limit < 1: limit = 24
-
-    where_parts: List[str] = []
-    params: List[Any] = []
-
-    sw, sp = _build_search_filters(search)
-    if sw:
-        where_parts.append(f"({sw})")
-        params.extend(sp)
-
+    # Optional category filter
     if category:
-        # exact match on category; could be changed to case-insensitive if needed
-        where_parts.append("(p.category = ?)")
-        params.append(category)
+        wheres.append("LOWER(p.category) = ?")
+        params.append(category.lower())
 
-    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    if wheres:
+        return "WHERE " + " AND ".join(wheres), params
+    return "", []
 
-    total_sql = f"""
-        SELECT COUNT(*) AS total
-        FROM (
-          SELECT p.id
-          FROM products p
-          JOIN offers o ON o.product_id = p.id
-          {where_sql}
-          GROUP BY p.id
-        ) x
+# -------------------- Routes --------------------
+
+@app.get("/health")
+def health():
+    return jsonify({"ok": True})
+
+@app.get("/products")
+def products():
     """
-    total = int(con.execute(total_sql, params).fetchone()["total"])
+    Returns ONLY products that actually have offers.
+    Paginated shape:
+    {
+      items: [{ id, name, category, min_price, vendors_count }],
+      total, page, limit
+    }
+    """
+    db = get_db()
+    q = request.args.get("search", "", type=str)
+    category = request.args.get("category", "", type=str)
+    page = max(request.args.get("page", 1, type=int), 1)
+    limit = min(max(request.args.get("limit", 24, type=int), 1), 100)
     offset = (page - 1) * limit
 
-    items_sql = f"""
-        SELECT
-          p.id,
-          p.name,
-          p.category,
-          MIN(o.price_pounds) AS min_price,
-          COUNT(DISTINCT o.vendor_id) AS vendors_count
+    tokens = tokens_from_query(q)
+
+    # offers aggregate ensures we only see products WITH offers
+    # stats: min price and distinct vendor count per product
+    where_sql, where_params = build_filter_sql(tokens, category)
+
+    # total count over filtered set (products with offers)
+    total_sql = f"""
+        WITH stats AS (
+            SELECT product_id,
+                   MIN(price_pounds) AS min_price,
+                   COUNT(DISTINCT vendor_id) AS vendors_count
+            FROM offers
+            GROUP BY product_id
+        )
+        SELECT COUNT(*)
         FROM products p
-        JOIN offers o ON o.product_id = p.id
+        JOIN stats s ON s.product_id = p.id
         {where_sql}
-        GROUP BY p.id
-        ORDER BY min_price ASC, p.name ASC
+    """
+    total = db.execute(total_sql, where_params).fetchone()[0]
+
+    # page of rows
+    rows_sql = f"""
+        WITH stats AS (
+            SELECT product_id,
+                   MIN(price_pounds) AS min_price,
+                   COUNT(DISTINCT vendor_id) AS vendors_count
+            FROM offers
+            GROUP BY product_id
+        )
+        SELECT p.id, p.name, p.category, s.min_price, s.vendors_count
+        FROM products p
+        JOIN stats s ON s.product_id = p.id
+        {where_sql}
+        ORDER BY p.name COLLATE NOCASE ASC
         LIMIT ? OFFSET ?
     """
-    rows = con.execute(items_sql, params + [limit, offset]).fetchall()
+    rows = db.execute(rows_sql, (*where_params, limit, offset)).fetchall()
+
     items = [
         {
             "id": r["id"],
             "name": r["name"],
-            "category": r.get("category") or None,
-            "min_price": float(r["min_price"]) if r["min_price"] is not None else None,
-            "vendors_count": int(r["vendors_count"]) if r["vendors_count"] is not None else 0,
+            "category": r["category"],
+            "min_price": r["min_price"],
+            "vendors_count": r["vendors_count"],
         }
         for r in rows
     ]
+
     return jsonify({"items": items, "total": total, "page": page, "limit": limit})
 
-@app.route("/products/<int:product_id>", methods=["GET"])
-def get_product(product_id: int):
+@app.get("/products/<int:pid>")
+def product_detail(pid: int):
     """
-    Returns one product with all vendor offers sorted by price.
+    { id, name, category, vendors: [{ vendor, price, buy_url }] }
+    Vendors sorted by ascending price.
     """
-    con = get_db()
-    p = con.execute(
-        "SELECT id, name, category FROM products WHERE id = ?",
-        (product_id,)
+    db = get_db()
+    pr = db.execute(
+        "SELECT id, name, category FROM products WHERE id = ?", (pid,)
     ).fetchone()
-    if not p:
-        return jsonify({"error": "Not found"}), 404
+    if not pr:
+        return jsonify({"error": "not found"}), 404
 
-    offers = con.execute(
+    offers = db.execute(
         """
         SELECT v.name AS vendor, o.price_pounds AS price, o.url AS buy_url
         FROM offers o
         JOIN vendors v ON v.id = o.vendor_id
         WHERE o.product_id = ?
-        ORDER BY o.price_pounds ASC, v.name ASC
+        ORDER BY o.price_pounds ASC, datetime(o.scraped_at) DESC, o.id DESC
         """,
-        (product_id,)
+        (pid,),
     ).fetchall()
 
-    return jsonify({
-        "id": p["id"],
-        "name": p["name"],
-        "category": p.get("category") or None,
-        "vendors": [
-            {"vendor": r["vendor"],
-             "price": float(r["price"]) if r["price"] is not None else None,
-             "buy_url": r["buy_url"]}
-            for r in offers
-        ],
-    })
+    vendors = [
+        {"vendor": r["vendor"], "price": r["price"], "buy_url": r["buy_url"]}
+        for r in offers
+    ]
 
-@app.route("/categories", methods=["GET"])
-def list_categories():
-    con = get_db()
-    rows = con.execute(
+    return jsonify({"id": pr["id"], "name": pr["name"], "category": pr["category"], "vendors": vendors})
+
+@app.get("/categories")
+def categories():
+    """
+    Distinct categories for products that actually have offers.
+    """
+    db = get_db()
+    rows = db.execute(
         """
-        SELECT DISTINCT category
-        FROM products
-        WHERE category IS NOT NULL AND TRIM(category) <> ''
-        ORDER BY category COLLATE NOCASE ASC
+        SELECT DISTINCT p.category
+        FROM products p
+        WHERE p.id IN (SELECT DISTINCT product_id FROM offers)
+          AND COALESCE(TRIM(p.category),'') != ''
+        ORDER BY p.category COLLATE NOCASE ASC
         """
     ).fetchall()
     return jsonify([r["category"] for r in rows])
 
 if __name__ == "__main__":
+    print(f"DB_PATH = {DB_PATH}")
     app.run(host="127.0.0.1", port=5000, debug=True)
