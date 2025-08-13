@@ -2,7 +2,7 @@
 import os
 import re
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 
 DB_PATH = os.environ.get("DB_PATH") or os.path.join(os.path.dirname(__file__), "..", "data", "tooltally.db")
 DB_PATH = os.path.abspath(DB_PATH)
@@ -148,12 +148,10 @@ def dict_factory(cursor, row):
     return {col[0]: row[idx] for idx, col in enumerate(cursor.description)}
 
 def _row_id(r):
-    """Return the 'id' from a row whether it's a dict or a tuple with single col."""
     if r is None:
         return None
     if isinstance(r, dict):
         return r.get("id")
-    # tuple/list fallback
     return r[0] if len(r) > 0 else None
 
 def ensure_vendor_id(cur, row) -> int | None:
@@ -204,6 +202,29 @@ def upsert_product(cur, name, category, fp, brand=None, model=None, voltage=None
     return cur.lastrowid
 
 def insert_or_replace_offer(cur, product_id, vendor_id, price, url, vendor_sku, scraped_at):
+    """
+    Upsert strategy to satisfy UNIQUE(url):
+      1) If an offer already exists with this URL, UPDATE that row (reassign product/vendor/price).
+      2) Else, if an offer exists for (product_id, vendor_id), UPDATE it.
+      3) Else, INSERT a new offer.
+    """
+    # 1) Upsert by URL (respect UNIQUE(url))
+    cur.execute("SELECT id FROM offers WHERE url=?", (url,))
+    r = cur.fetchone()
+    oid = _row_id(r)
+    if oid:
+        cur.execute("""
+            UPDATE offers
+               SET product_id=?,
+                   vendor_id=?,
+                   price_pounds=?,
+                   vendor_sku=?,
+                   scraped_at=?
+             WHERE id=?
+        """, (product_id, vendor_id, price, vendor_sku, scraped_at, oid))
+        return
+
+    # 2) Update latest offer from same vendor for this product
     cur.execute("""
         SELECT id FROM offers
         WHERE product_id=? AND vendor_id=?
@@ -221,11 +242,13 @@ def insert_or_replace_offer(cur, product_id, vendor_id, price, url, vendor_sku, 
                    scraped_at=?
              WHERE id=?
         """, (price, url, vendor_sku, scraped_at, oid))
-    else:
-        cur.execute("""
-            INSERT INTO offers(product_id, vendor_id, price_pounds, url, vendor_sku, scraped_at, created_at)
-            VALUES(?, ?, ?, ?, ?, ?, ?)
-        """, (product_id, vendor_id, price, url, vendor_sku, scraped_at, datetime.utcnow().isoformat() + "Z"))
+        return
+
+    # 3) Insert fresh
+    cur.execute("""
+        INSERT INTO offers(product_id, vendor_id, price_pounds, url, vendor_sku, scraped_at, created_at)
+        VALUES(?, ?, ?, ?, ?, ?, ?)
+    """, (product_id, vendor_id, price, url, vendor_sku, scraped_at, datetime.now(timezone.utc).isoformat()))
 
 # --------------------------------- Main --------------------------------------
 
@@ -264,7 +287,7 @@ def main():
             url = row.get("url") or row.get("buy_url") or None
             vendor_sku = row.get("vendor_sku") or row.get("sku") or None
             ean_gtin = row.get("ean_gtin") or row.get("ean") or row.get("gtin") or None
-            scraped_at = row.get("scraped_at") or datetime.utcnow().isoformat() + "Z"
+            scraped_at = row.get("scraped_at") or datetime.now(timezone.utc).isoformat()
 
             if price is None or url is None:
                 continue
