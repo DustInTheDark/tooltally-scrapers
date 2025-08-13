@@ -61,7 +61,7 @@ def norm_lower(s: str) -> str:
 
 def base_category(cat: str) -> str:
     c = norm_lower(cat)
-    return CAT_MAP.get(c, CAT_MAP.get(c.rstrip("s"), c))  # map plurals too
+    return CAT_MAP.get(c, CAT_MAP.get(c.rstrip("s"), c))
 
 def extract_brand(title: str) -> str:
     m = re.search(BRANDS, title or "", re.I)
@@ -106,7 +106,6 @@ def extract_subtokens(title: str) -> list[str]:
     found = set()
     for tok in SUBTOKENS:
         if re.search(rf"\b{re.escape(tok)}\b", t):
-            # collapse variants like "ball pein" -> "ball-pein"
             found.add(tok.replace(" ", "-"))
     return sorted(found)
 
@@ -120,14 +119,14 @@ def build_fingerprint(title: str, category: str, vendor_sku: str | None = None, 
     kit = extract_kit(title)
     cat = base_category(category or "")
 
-    # Primary (power tools): brand + model + voltage + kit + category
+    # Primary (power tools)
     if model or volt:
         parts = [brand, model, str(volt or ""), kit, cat]
         key = " | ".join([p for p in parts if p])
         if key:
             return key
 
-    # Fallback for hand tools (e.g., hammers/saws): brand + base cat + sizes + subtype
+    # Hand tools: brand + base cat + sizes + subtype
     sizes = extract_sizes(title)
     subs = extract_subtokens(title)
     if brand or sizes or subs or cat:
@@ -136,19 +135,26 @@ def build_fingerprint(title: str, category: str, vendor_sku: str | None = None, 
         if key:
             return key
 
-    # Final fallback
     if vendor_sku:
         return f"sku:{norm_lower(vendor_sku)}"
 
-    # Last resort: heavily cleaned title tokens (digits + key words only)
     tokens = [t for t in re.findall(r"[a-z0-9]+", norm_lower(title)) if t not in STOPWORDS]
     key = " ".join(tokens[:8])
     return f"title:{key}" if key else ""
 
-# ----------------------- DB helpers (unchanged behavior) ----------------------
+# ----------------------- DB helpers (dict-safe) -------------------------------
 
 def dict_factory(cursor, row):
     return {col[0]: row[idx] for idx, col in enumerate(cursor.description)}
+
+def _row_id(r):
+    """Return the 'id' from a row whether it's a dict or a tuple with single col."""
+    if r is None:
+        return None
+    if isinstance(r, dict):
+        return r.get("id")
+    # tuple/list fallback
+    return r[0] if len(r) > 0 else None
 
 def ensure_vendor_id(cur, row) -> int | None:
     vid = row.get("vendor_id")
@@ -159,13 +165,15 @@ def ensure_vendor_id(cur, row) -> int | None:
     if vname:
         cur.execute("SELECT id FROM vendors WHERE lower(name)=lower(?)", (vname,))
         r = cur.fetchone()
-        if r:
-            return r[0]
+        rid = _row_id(r)
+        if rid:
+            return rid
     if vdom:
         cur.execute("SELECT id FROM vendors WHERE lower(domain)=?", (vdom,))
         r = cur.fetchone()
-        if r:
-            return r[0]
+        rid = _row_id(r)
+        if rid:
+            return rid
     if vname:
         cur.execute("INSERT INTO vendors(name, domain) VALUES(?, ?)", (vname, vdom or None))
         return cur.lastrowid
@@ -174,9 +182,9 @@ def ensure_vendor_id(cur, row) -> int | None:
 def upsert_product(cur, name, category, fp, brand=None, model=None, voltage=None, kit=None, ean_gtin=None):
     if fp:
         cur.execute("SELECT id FROM products WHERE fingerprint = ?", (fp,))
-        row = cur.fetchone()
-        if row:
-            pid = row[0]
+        r = cur.fetchone()
+        pid = _row_id(r)
+        if pid:
             cur.execute("""
                 UPDATE products
                    SET name = COALESCE(name, ?),
@@ -202,8 +210,9 @@ def insert_or_replace_offer(cur, product_id, vendor_id, price, url, vendor_sku, 
         ORDER BY datetime(scraped_at) DESC
         LIMIT 1
     """, (product_id, vendor_id))
-    row = cur.fetchone()
-    if row:
+    r = cur.fetchone()
+    oid = _row_id(r)
+    if oid:
         cur.execute("""
             UPDATE offers
                SET price_pounds=?,
@@ -211,7 +220,7 @@ def insert_or_replace_offer(cur, product_id, vendor_id, price, url, vendor_sku, 
                    vendor_sku=?,
                    scraped_at=?
              WHERE id=?
-        """, (price, url, vendor_sku, scraped_at, row[0]))
+        """, (price, url, vendor_sku, scraped_at, oid))
     else:
         cur.execute("""
             INSERT INTO offers(product_id, vendor_id, price_pounds, url, vendor_sku, scraped_at, created_at)
