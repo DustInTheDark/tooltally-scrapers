@@ -1,4 +1,3 @@
-powershell -Command "$content=@'
 # ToolTally Backend — Quick Ops Guide
 
 ## How it works (rough outline)
