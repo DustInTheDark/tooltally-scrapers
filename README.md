@@ -35,3 +35,7 @@ py -c \"import sqlite3; con=sqlite3.connect(r'data\\tooltally.db'); print('model
 :: 7) Run API
 py api.py
 '@; Set-Content -Path README.md -Value $content -Encoding UTF8"
+
+
+## frontend repo link
+:: frontend repo link: https://github.com/DustInTheDark/tooltally-frontend
