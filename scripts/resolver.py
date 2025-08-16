@@ -7,12 +7,13 @@ Resolver / Canonicalizer for ToolTally
 - Matching priority:
     1) EAN/GTIN (exact)
     2) MPN (normalized)
-    3) Fuzzy Name (brand+model+voltage+category; SequenceMatcher >= threshold)
-    4) Rich power-tool fingerprint: brand+model+voltage+kit+bundle+charger+case+category
-    5) Hand-tool fingerprint: brand + base_category + sizes/subtypes
+    3) Fuzzy Name (brand+model+voltage signature; SequenceMatcher >= threshold)
+    4) Canonical model fingerprint: model:{brand|MODEL_CLEAN|volt}
+    5) Hand-tool fingerprint (brand + normalized family + size/subtype)
     6) Vendor SKU fingerprint
     7) Title-token fingerprint
-- Product upsert is COLLISION-SAFE even with a composite UNIQUE index.
+- Category is normalized into stable families (Drills, Impact Drivers, ... Hand Saws, Hammers, Accessories, Other).
+- Product upsert is COLLISION-SAFE even with composite uniques.
 - Offer upsert honors UNIQUE(url) and reassigns to the canonical product.
 """
 
@@ -23,6 +24,8 @@ import sqlite3
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 from difflib import SequenceMatcher
+
+from category_rules import normalise_category  # NEW
 
 # --------------------------------------------------------------------------------------
 # DB path
@@ -89,11 +92,6 @@ SUBTOKENS = [
     # saws
     "handsaw", "panel", "tenon", "rip", "bow", "hacksaw", "junior", "coping",
 ]
-CAT_MAP = {
-    "hammer": "hammer", "hammers": "hammer",
-    "saw": "saw", "saws": "saw", "hand saw": "saw", "handsaw": "saw", "hacksaw": "saw",
-    "drill": "drill", "drills": "drill", "drill driver": "drill", "drill drivers": "drill",
-}
 SIZE_PATTERNS = [
     (r"\b(\d+)\s*oz\b",  lambda m: f"oz{m.group(1)}"),
     (r"\b(\d+)\s*g\b",   lambda m: f"g{m.group(1)}"),
@@ -104,12 +102,6 @@ SIZE_PATTERNS = [
 ]
 STOPWORDS = {"unit","bare","body","only","kit","set","refurb","electric","corded","cordless","combi",
              "plus","brushless","li-ion","lithium","max","with","and","the","tool"}
-
-# ---- basic extractors ----
-
-def base_category(cat: str) -> str:
-    c = norm_lower(cat)
-    return CAT_MAP.get(c, CAT_MAP.get(c.rstrip("s"), c))
 
 def extract_brand(title: str) -> str:
     m = re.search(BRANDS, title or "", re.I)
@@ -122,6 +114,15 @@ def extract_model(title: str) -> str:
         if m:
             return m.group(1)
     return ""
+
+def clean_model_code(model: str) -> str:
+    if not model:
+        return ""
+    m = model.strip().upper()
+    # strip common kit/bundle suffixes (F001, P2T, K2T, SET, KIT, -xx, etc.)
+    m = re.sub(r"(?:F\d{1,3}|P\d{1,3}[A-Z]?|K\d{1,3}[A-Z]?|SET|KIT)$", "", m)
+    m = re.sub(r"[-_](?:XJ|X1|X2|X3|L?Z|N|B|C|S|Q|GB)$", "", m)
+    return m.strip()
 
 def extract_voltage(title: str) -> int | None:
     t = (title or "").lower()
@@ -141,21 +142,6 @@ def extract_kit(title: str) -> str:
             return label
     return ""
 
-def extract_battery_bundle(title: str) -> str:
-    t = (title or "").lower()
-    m = BATTERY_BUNDLE.search(t)
-    if not m:
-        return ""
-    count, cap = m.group(1), m.group(2)
-    cap = cap.rstrip("0").rstrip(".") if "." in cap else cap
-    return f"{count}x{cap}Ah"
-
-def has_charger(title: str) -> bool:
-    return bool(CHARGER_TOKEN.search(title or ""))
-
-def has_case(title: str) -> bool:
-    return bool(CASE_TOKEN.search(title or ""))
-
 def extract_sizes(title: str) -> list[str]:
     t = norm_lower(title)
     out = set()
@@ -172,15 +158,13 @@ def extract_subtokens(title: str) -> list[str]:
             found.add(tok.replace(" ", "-"))
     return sorted(found)
 
-# ---- name signature & fingerprints ----
-
 def name_signature(title: str, category: str) -> str:
-    """Compact, comparable signature for fuzzy match: brand + model + volt + base_category."""
+    """Compact signature for fuzzy match: brand + cleaned model + volt + normalized family."""
     brand = extract_brand(title)
-    model = extract_model(title)
+    model = clean_model_code(extract_model(title))
     volt  = extract_voltage(title)
-    cat   = base_category(category or "")
-    parts = [p for p in [brand, model, str(volt or ""), cat] if p]
+    fam   = normalise_category(category, title)
+    parts = [p for p in [brand, model, str(volt or ""), fam] if p]
     return " ".join(parts).lower()
 
 def build_fingerprint(title: str, category: str, vendor_sku: str | None,
@@ -194,33 +178,30 @@ def build_fingerprint(title: str, category: str, vendor_sku: str | None,
     if nmpn:
         return f"mpn:{nmpn}"
 
-    # ---- MODEL-LEVEL CANONICALISATION (the important change) ----
-    # Power tools: canonicalise on brand + model + voltage only.
+    # 3) Canonical model key (brand|MODEL_CLEAN|volt)
     brand = extract_brand(title)
-    model = extract_model(title)
+    model_raw = extract_model(title)
+    model = clean_model_code(model_raw)
     volt  = extract_voltage(title)
-    if brand or model or volt:
-        b = (brand or "").lower()
-        m = (model or "").upper()   # models are usually upper-case codes
-        v = str(volt or "")
-        if b or m or v:
-            return f"model:{b}|{m}|{v}"
+    if (brand or model) and volt:
+        return f"model:{brand}|{model}|{volt}"
+    if brand and model:
+        return f"model:{brand}|{model}"
 
-    # Hand tools: keep previous behavior (brand + base_category + sizes/subtypes)
-    cat = base_category(category or "")
+    # 4) Hand tools: normalized family + sizes/subtypes
+    fam = normalise_category(category, title)
     sizes = extract_sizes(title)
     subs  = extract_subtokens(title)
-    if brand or sizes or subs or cat:
-        parts = [brand, cat] + sizes + subs
-        key   = " | ".join([p for p in parts if p])
-        if key:
-            return key
+    parts = [brand, fam] + sizes + subs
+    key   = " | ".join([p for p in parts if p])
+    if key:
+        return key
 
-    # Vendor SKU
+    # 5) Vendor SKU
     if vendor_sku:
         return f"sku:{norm_lower(vendor_sku)}"
 
-    # Title tokens fallback
+    # 6) Title tokens fallback
     tokens = [t for t in re.findall(r"[a-z0-9]+", norm_lower(title)) if t not in STOPWORDS]
     key = " ".join(tokens[:8])
     return f"title:{key}" if key else ""
@@ -230,9 +211,6 @@ def build_fingerprint(title: str, category: str, vendor_sku: str | None,
 # --------------------------------------------------------------------------------------
 
 def ensure_vendor_id(cur, row) -> int | None:
-    """
-    Resolve vendor by name first (preferred), else by URL domain. Create if missing.
-    """
     vname = norm_space(row.get("vendor") or row.get("vendor_name") or "")
     if vname:
         cur.execute("SELECT id FROM vendors WHERE lower(name)=lower(?)", (vname,))
@@ -262,15 +240,9 @@ def ensure_vendor_id(cur, row) -> int | None:
     return None
 
 def normalize_existing_fingerprints(cur):
-    """Lower/trim all existing fingerprints to avoid future collisions."""
     cur.execute("UPDATE products SET fingerprint = lower(trim(fingerprint)) WHERE fingerprint IS NOT NULL;")
 
 def try_update_product_fields(cur, pid: int, *, name, category, brand, model, voltage, kit, ean_gtin):
-    """
-    Try to backfill product fields. If a UNIQUE constraint would be violated
-    (e.g., composite unique on name/category), fall back to updating only
-    non-unique fields to avoid crashing.
-    """
     try:
         cur.execute("""
             UPDATE products
@@ -284,7 +256,6 @@ def try_update_product_fields(cur, pid: int, *, name, category, brand, model, vo
              WHERE id = ?
         """, (name, category, brand, model, voltage, kit, ean_gtin, pid))
     except sqlite3.IntegrityError:
-        # Retry a narrower update that cannot violate typical unique(name,category)
         cur.execute("""
             UPDATE products
                SET brand     = COALESCE(brand, ?),
@@ -315,11 +286,9 @@ def product_min_price(cur, product_id: int) -> float | None:
         return None
     return r.get("min_price")
 
-def candidate_rows_for_fuzzy(cur, brand: str, model: str, cat: str, name_like: str, limit: int = 160):
+def candidate_rows_for_fuzzy(cur, brand: str, model: str, name_like: str, limit: int = 160):
     params = []
     where = []
-
-    # Prefer same category but don't require it — we’ll score via SequenceMatcher
     if brand:
         where.append("(lower(brand) = lower(?))")
         params.append(brand)
@@ -342,17 +311,15 @@ def candidate_rows_for_fuzzy(cur, brand: str, model: str, cat: str, name_like: s
     return cur.fetchall()
 
 def fuzzy_match_product(cur, title: str, category: str, price: float, ratio_threshold: float = 0.90):
-    """Return product_id if a strong fuzzy match is found; else None."""
     sig = name_signature(title, category)
     if not sig:
         return None
 
     brand = extract_brand(title)
-    model = extract_model(title)
-    cat   = base_category(category or "")
-    like_hint = model or brand or ""  # hint for LIKE when we have very little
+    model = clean_model_code(extract_model(title))
+    like_hint = model or brand or ""
 
-    candidates = candidate_rows_for_fuzzy(cur, brand, model, cat, like_hint, limit=120)
+    candidates = candidate_rows_for_fuzzy(cur, brand, model, like_hint, limit=200)
     if not candidates:
         return None
 
@@ -371,13 +338,13 @@ def fuzzy_match_product(cur, title: str, category: str, price: float, ratio_thre
     if best_id is None or best_ratio < ratio_threshold:
         return None
 
-    # sanity gate: price ratio check to avoid merging bare units with big kits etc.
+    # price sanity gate
     min_p = product_min_price(cur, best_id)
     if min_p is None:
         return best_id
     low, high = min(price, min_p), max(price, min_p)
     ratio = (low / high) if high > 0 else 1.0
-    if ratio < 0.20:  # too far apart, likely different bundles
+    if ratio < 0.20:  # too far apart
         return None
 
     return best_id
@@ -388,15 +355,9 @@ def fuzzy_match_product(cur, title: str, category: str, price: float, ratio_thre
 
 def upsert_product(cur, *, name, category, fingerprint,
                    brand=None, model=None, voltage=None, kit=None, ean_gtin=None) -> int:
-    """
-    Collision-safe upsert by fingerprint; also consult (name,category).
-    - Normalize `fingerprint` to lower(trim()).
-    - If a row exists (by fingerprint or by name/category), update fields safely.
-    - Else, INSERT OR IGNORE, then SELECT id.
-    """
     fprint = (fingerprint or "").strip().lower() or None
 
-    # 1) Existing by fingerprint?
+    # 1) by fingerprint
     if fprint:
         cur.execute("SELECT id FROM products WHERE lower(trim(fingerprint)) = ?", (fprint,))
         pid = _row_id(cur.fetchone())
@@ -407,7 +368,7 @@ def upsert_product(cur, *, name, category, fingerprint,
                                       kit=kit, ean_gtin=ean_gtin)
             return pid
 
-    # 2) Existing by (name, category)?
+    # 2) by (name, category)
     pid2 = select_product_id_by_name_category(cur, name, category)
     if pid2:
         if fprint:
@@ -425,7 +386,7 @@ def upsert_product(cur, *, name, category, fingerprint,
                                   kit=kit, ean_gtin=ean_gtin)
         return pid2
 
-    # 3) Insert new canonical row (ignore duplicates)
+    # 3) insert new (ignore duplicates)
     cur.execute("""
         INSERT OR IGNORE INTO products(name, category, fingerprint, brand, model, voltage, kit, ean_gtin)
         VALUES(?, ?, ?, ?, ?, ?, ?, ?)
@@ -434,7 +395,7 @@ def upsert_product(cur, *, name, category, fingerprint,
     if cur.lastrowid:
         return cur.lastrowid
 
-    # 4) If insert ignored, fetch existing by fingerprint or name/category
+    # 4) fetch existing after ignored insert
     if fprint:
         cur.execute("SELECT id FROM products WHERE lower(trim(fingerprint)) = ?", (fprint,))
         pid3 = _row_id(cur.fetchone())
@@ -453,7 +414,7 @@ def upsert_product(cur, *, name, category, fingerprint,
                                   kit=kit, ean_gtin=ean_gtin)
         return pid4
 
-    # 5) Last-chance insert (very rare)
+    # 5) last resort
     cur.execute("""
         INSERT INTO products(name, category, fingerprint, brand, model, voltage, kit, ean_gtin)
         VALUES(?, ?, ?, ?, ?, ?, ?, ?)
@@ -461,13 +422,7 @@ def upsert_product(cur, *, name, category, fingerprint,
     return cur.lastrowid
 
 def insert_or_replace_offer(cur, *, product_id, vendor_id, price, url, vendor_sku, scraped_at):
-    """
-    Offer upsert honoring UNIQUE(url):
-      - If URL exists → reassign/overwrite that row.
-      - Else update the latest existing offer for (product,vendor).
-      - Else insert new.
-    """
-    # 1) by URL
+    # by URL
     cur.execute("SELECT id FROM offers WHERE url = ?", (url,))
     oid = _row_id(cur.fetchone())
     if oid:
@@ -482,7 +437,7 @@ def insert_or_replace_offer(cur, *, product_id, vendor_id, price, url, vendor_sk
         """, (product_id, vendor_id, price, vendor_sku, scraped_at, oid))
         return
 
-    # 2) latest by (product, vendor)
+    # latest by (product, vendor)
     cur.execute("""
         SELECT id FROM offers
          WHERE product_id = ? AND vendor_id = ?
@@ -501,7 +456,7 @@ def insert_or_replace_offer(cur, *, product_id, vendor_id, price, url, vendor_sk
         """, (price, url, vendor_sku, scraped_at, oid))
         return
 
-    # 3) insert new
+    # insert
     cur.execute("""
         INSERT INTO offers(product_id, vendor_id, price_pounds, url, vendor_sku, scraped_at, created_at)
         VALUES(?, ?, ?, ?, ?, ?, ?)
@@ -520,7 +475,7 @@ def main():
     cur.execute("PRAGMA foreign_keys=ON;")
 
     # Normalize legacy fingerprints to avoid collisions
-    normalize_existing_fingerprints(cur)
+    cur.execute("UPDATE products SET fingerprint = lower(trim(fingerprint)) WHERE fingerprint IS NOT NULL;")
     con.commit()
 
     # Load unprocessed rows
@@ -543,7 +498,8 @@ def main():
         cur.execute("BEGIN;")
         for row in raw_rows:
             title       = row.get("title") or row.get("name") or ""
-            category    = row.get("category") or row.get("category_name") or ""
+            raw_cat     = row.get("category") or row.get("category_name") or ""
+            category    = normalise_category(raw_cat, title)   # NEW: normalized family
             price       = row.get("price_pounds") or row.get("price") or None
             url         = row.get("url") or row.get("buy_url") or None
             vendor_sku  = row.get("vendor_sku") or row.get("sku") or None
@@ -567,20 +523,19 @@ def main():
                     cur.execute("UPDATE raw_offers SET processed=1 WHERE id=?", (row["id"],))
                 continue
 
-            # --- matching priority ---
-            # 1) EAN/GTIN or 2) MPN via fingerprints/upsert
+            # matching
             pid = None
             if ean_gtin or mpn:
                 fingerprint = build_fingerprint(title, category, vendor_sku, ean_gtin, mpn)
                 brand   = extract_brand(title) or None
-                model   = extract_model(title) or None
+                model   = clean_model_code(extract_model(title)) or None
                 voltage = extract_voltage(title)
                 kit     = extract_kit(title) or None
 
                 pid = upsert_product(
                     cur,
                     name=norm_space(title) or None,
-                    category=norm_space(category) or None,
+                    category=category,
                     fingerprint=fingerprint,
                     brand=brand,
                     model=model,
@@ -589,33 +544,31 @@ def main():
                     ean_gtin=ean_gtin or None,
                 )
             else:
-                # 3) Fuzzy name match BEFORE inserting a new product
+                # fuzzy first
                 p_fuzzy = fuzzy_match_product(cur, title, category, price, ratio_threshold=0.90)
                 if p_fuzzy:
                     brand   = extract_brand(title) or None
-                    model   = extract_model(title) or None
+                    model   = clean_model_code(extract_model(title)) or None
                     voltage = extract_voltage(title)
                     kit     = extract_kit(title) or None
-                    # Backfill non-unique fields on the existing candidate
                     try_update_product_fields(cur, p_fuzzy,
                                               name=norm_space(title) or None,
-                                              category=norm_space(category) or None,
+                                              category=category,
                                               brand=brand, model=model, voltage=voltage, kit=kit,
                                               ean_gtin=ean_gtin or None)
                     pid = p_fuzzy
 
-            # 4) If still not found, fall back to deterministic fingerprint upsert
             if not pid:
                 fingerprint = build_fingerprint(title, category, vendor_sku, ean_gtin, mpn)
                 brand   = extract_brand(title) or None
-                model   = extract_model(title) or None
+                model   = clean_model_code(extract_model(title)) or None
                 voltage = extract_voltage(title)
                 kit     = extract_kit(title) or None
 
                 pid = upsert_product(
                     cur,
                     name=norm_space(title) or None,
-                    category=norm_space(category) or None,
+                    category=category,
                     fingerprint=fingerprint,
                     brand=brand,
                     model=model,
@@ -624,7 +577,6 @@ def main():
                     ean_gtin=ean_gtin or None,
                 )
 
-            # Offers upsert
             insert_or_replace_offer(
                 cur,
                 product_id=pid,
@@ -635,7 +587,6 @@ def main():
                 scraped_at=scraped_at,
             )
 
-            # mark processed
             if "id" in row:
                 cur.execute("UPDATE raw_offers SET processed=1 WHERE id=?", (row["id"],))
 
