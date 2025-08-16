@@ -31,30 +31,59 @@ Frontend: [tooltally-frontend](https://github.com/DustInTheDark/tooltally-fronte
 
 ### CMD (Windows Command Prompt)
 ```cmd
-REM 1. Activate venv
+1. Activate venv
 cd tooltally-scrapers
 .venv\Scripts\activate
 
-REM 2. Backup DB
+2. Backup DB
 copy data\tooltally.db data\backups\tooltally_%date:~-4%%date:~3,2%%date:~0,2%.db
 
-REM 3. Reset raw_offers
+3. Reset raw_offers
 py -c "import sqlite3; con=sqlite3.connect(r'data\\tooltally.db'); cur=con.cursor(); cur.execute('UPDATE raw_offers SET processed=0'); con.commit(); con.close(); print('Reset processed=0')"
 
-REM 4. (Optional) Enrich identifiers
+. (Optional) Enrich identifiers
 set ALLOW=screwfix.com,toolstation.com,ukplanettools.co.uk,dm-tools.co.uk
 set LIMIT=5000
 py scripts\enrich_identifiers_from_pages.py
 
-REM 5. Resolve
+. Resolve
 py scripts\resolver.py
 
-REM 6. Deduplicate
+. Deduplicate
 py scripts\dedupe_offers.py
 
-REM 7. Health checks
+. Health checks
 py -c "import sqlite3; con=sqlite3.connect(r'data\\tooltally.db'); print('Products with >1 vendor:', con.execute('select count(*) from (select product_id, count(distinct vendor_id) c from offers group by product_id having c>1)').fetchone()[0]); con.close()"
 py -c "import sqlite3; con=sqlite3.connect(r'data\\tooltally.db'); print('Model-key products:', con.execute(\"select count(*) from products where fingerprint like 'model:%'\").fetchone()[0]); con.close()"
 
-REM 8. Run backend API
+. Run backend API
 py api.py
+
+### Windows PowerShell
+''' PowerShell
+# 1. Activate venv
+cd tooltally-scrapers
+.venv\Scripts\Activate.ps1
+
+# 2. Backup DB
+Copy-Item data\tooltally.db "data\backups\tooltally_$(Get-Date -Format yyyyMMdd).db"
+
+# 3. Reset
+py -c "import sqlite3; con=sqlite3.connect(r'data\\tooltally.db'); cur=con.cursor(); cur.execute('UPDATE raw_offers SET processed=0'); con.commit(); con.close(); print('Reset processed=0')"
+
+# 4. (Optional) Enrich identifiers
+$env:ALLOW="screwfix.com,toolstation.com,ukplanettools.co.uk,dm-tools.co.uk"
+$env:LIMIT="5000"
+py scripts\enrich_identifiers_from_pages.py
+
+# 5. Resolve + dedupe
+py scripts\resolver.py
+py scripts\dedupe_offers.py
+
+# 6. Health checks
+py -c "import sqlite3; con=sqlite3.connect(r'data\\tooltally.db'); print('Products with >1 vendor:', con.execute('select count(*) from (select product_id, count(distinct vendor_id) c from offers group by product_id having c>1)').fetchone()[0]); con.close()"
+py -c "import sqlite3; con=sqlite3.connect(r'data\\tooltally.db'); print('Model-key products:', con.execute(\"select count(*) from products where fingerprint like 'model:%'\").fetchone()[0]); con.close()"
+
+# 7. Run API
+py api.py
+
