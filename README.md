@@ -58,32 +58,3 @@ py -c "import sqlite3; con=sqlite3.connect(r'data\\tooltally.db'); print('Model-
 
 . Run backend API
 py api.py
-
-### Windows PowerShell
-''' PowerShell
-# 1. Activate venv
-cd tooltally-scrapers
-.venv\Scripts\Activate.ps1
-
-# 2. Backup DB
-Copy-Item data\tooltally.db "data\backups\tooltally_$(Get-Date -Format yyyyMMdd).db"
-
-# 3. Reset
-py -c "import sqlite3; con=sqlite3.connect(r'data\\tooltally.db'); cur=con.cursor(); cur.execute('UPDATE raw_offers SET processed=0'); con.commit(); con.close(); print('Reset processed=0')"
-
-# 4. (Optional) Enrich identifiers
-$env:ALLOW="screwfix.com,toolstation.com,ukplanettools.co.uk,dm-tools.co.uk"
-$env:LIMIT="5000"
-py scripts\enrich_identifiers_from_pages.py
-
-# 5. Resolve + dedupe
-py scripts\resolver.py
-py scripts\dedupe_offers.py
-
-# 6. Health checks
-py -c "import sqlite3; con=sqlite3.connect(r'data\\tooltally.db'); print('Products with >1 vendor:', con.execute('select count(*) from (select product_id, count(distinct vendor_id) c from offers group by product_id having c>1)').fetchone()[0]); con.close()"
-py -c "import sqlite3; con=sqlite3.connect(r'data\\tooltally.db'); print('Model-key products:', con.execute(\"select count(*) from products where fingerprint like 'model:%'\").fetchone()[0]); con.close()"
-
-# 7. Run API
-py api.py
-
