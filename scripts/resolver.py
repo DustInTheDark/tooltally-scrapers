@@ -194,22 +194,20 @@ def build_fingerprint(title: str, category: str, vendor_sku: str | None,
     if nmpn:
         return f"mpn:{nmpn}"
 
-    # 3) Power tools
+    # ---- MODEL-LEVEL CANONICALISATION (the important change) ----
+    # Power tools: canonicalise on brand + model + voltage only.
     brand = extract_brand(title)
     model = extract_model(title)
     volt  = extract_voltage(title)
-    kit   = extract_kit(title)
-    cat   = base_category(category or "")
-    if model or volt:
-        bundle  = extract_battery_bundle(title)
-        charger = "chg" if has_charger(title) else ""
-        case    = "case" if has_case(title) else ""
-        parts   = [brand, model, str(volt or ""), kit, bundle, charger, case, cat]
-        key     = " | ".join([p for p in parts if p])
-        if key:
-            return key
+    if brand or model or volt:
+        b = (brand or "").lower()
+        m = (model or "").upper()   # models are usually upper-case codes
+        v = str(volt or "")
+        if b or m or v:
+            return f"model:{b}|{m}|{v}"
 
-    # 4) Hand tools
+    # Hand tools: keep previous behavior (brand + base_category + sizes/subtypes)
+    cat = base_category(category or "")
     sizes = extract_sizes(title)
     subs  = extract_subtokens(title)
     if brand or sizes or subs or cat:
@@ -218,11 +216,11 @@ def build_fingerprint(title: str, category: str, vendor_sku: str | None,
         if key:
             return key
 
-    # 5) Vendor SKU
+    # Vendor SKU
     if vendor_sku:
         return f"sku:{norm_lower(vendor_sku)}"
 
-    # 6) Title tokens
+    # Title tokens fallback
     tokens = [t for t in re.findall(r"[a-z0-9]+", norm_lower(title)) if t not in STOPWORDS]
     key = " ".join(tokens[:8])
     return f"title:{key}" if key else ""
@@ -317,28 +315,27 @@ def product_min_price(cur, product_id: int) -> float | None:
         return None
     return r.get("min_price")
 
-def candidate_rows_for_fuzzy(cur, brand: str, model: str, cat: str, name_like: str, limit: int = 80):
+def candidate_rows_for_fuzzy(cur, brand: str, model: str, cat: str, name_like: str, limit: int = 160):
     params = []
-    where = ["lower(trim(category)) = lower(trim(?))"]
-    params.append(cat or "")
+    where = []
 
+    # Prefer same category but don't require it — we’ll score via SequenceMatcher
     if brand:
         where.append("(lower(brand) = lower(?))")
         params.append(brand)
     if model:
-        where.append("(lower(model) = lower(?))")
+        where.append("(upper(model) = upper(?))")
         params.append(model)
         where.append("(lower(name) LIKE lower(?))")
         params.append(f"%{model.lower()}%")
-    else:
-        if name_like:
-            where.append("(lower(name) LIKE lower(?))")
-            params.append(f"%{name_like.lower()}%")
+    elif name_like:
+        where.append("(lower(name) LIKE lower(?))")
+        params.append(f"%{name_like.lower()}%")
 
     sql = f"""
         SELECT id, name, category, brand, model
         FROM products
-        WHERE {" AND ".join(where)}
+        {"WHERE " + " AND ".join(where) if where else ""}
         LIMIT {int(limit)}
     """
     cur.execute(sql, tuple(params))
