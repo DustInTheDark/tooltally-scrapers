@@ -1,158 +1,293 @@
 # scripts/enrich_identifiers_from_pages.py
-"""
-Resumable enrichment of raw_offers.ean_gtin/mpn by fetching product pages.
+# Enrich raw_offers with EAN/GTIN and MPN by fetching product pages.
+# Targeted for hosts: toolstation.com, ukplanettools.co.uk, dm-tools.co.uk, screwfix.com
+#
+# Requires: requests, beautifulsoup4
 
-Improvements vs previous version:
-- Domain allowlist to avoid slow/low-yield sites (configure ALLOW_DOMAINS).
-- Resumable: records progress so reruns skip completed URLs.
-- Retries with backoff; shorter timeout.
-- Optional LIMIT to test on a subset first.
-
-Usage examples:
-    py scripts\\enrich_identifiers_from_pages.py           # run with defaults
-    set ALLOW=toolstation.com,screwfix.com                 # PowerShell: $env:ALLOW="..."
-    set LIMIT=800
-    py scripts\\enrich_identifiers_from_pages.py
-"""
-from __future__ import annotations
-import os, sqlite3, time
-from datetime import datetime, timezone
+import os
+import re
+import json
+import time
+import sqlite3
+from urllib.parse import urlparse
 
 import requests
-from requests.adapters import HTTPAdapter, Retry
+from bs4 import BeautifulSoup
 
-from util_identifiers import extract_identifiers_from_html
+DB_PATH = os.environ.get("DB_PATH") or os.path.join(os.path.dirname(__file__), "..", "data", "tooltally.db")
+DB_PATH = os.path.abspath(DB_PATH)
 
-DB_PATH = os.path.abspath(os.environ.get("DB_PATH") or os.path.join(os.path.dirname(__file__), "..", "data", "tooltally.db"))
+TIMEOUT = 15
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; ToolTallyBot/1.0; +https://example.com/bot) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+}
 
-# Configure which domains to enrich (comma-separated env var ALLOW, or default list)
-DEFAULT_ALLOW = ["screwfix.com", "toolstation.com", "ukplanettools.co.uk"]
-ALLOW_DOMAINS = [d.strip().lower() for d in (os.environ.get("ALLOW") or ",".join(DEFAULT_ALLOW)).split(",") if d.strip()]
+# ---------- Normalisers ----------
 
-# Optional limit from env
-LIMIT = None
-try:
-    _lim = os.environ.get("LIMIT")
-    LIMIT = int(_lim) if _lim else None
-except Exception:
-    LIMIT = None
+def norm_text(s: str) -> str:
+    if not s:
+        return ""
+    return re.sub(r"\s+", " ", s).strip()
 
-TIMEOUT = 8   # seconds
-PAUSE   = 0.25  # seconds between requests
+def norm_mpn(s: str) -> str:
+    s = norm_text(s)
+    # Common cruft
+    s = re.sub(r"\b(?:mpn|model|manufacturer part(?: number)?|part(?: number)?|sku)\b[:\s]*", "", s, flags=re.I)
+    # Keep alnum + dashes/slashes only
+    s = re.sub(r"[^A-Za-z0-9\-/]", "", s)
+    return s[:64] if s else ""
 
-def make_session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-                       " AppleWebKit/537.36 (KHTML, like Gecko)"
-                       " Chrome/124.0.0.0 Safari/537.36")
-    })
-    retries = Retry(
-        total=2,
-        backoff_factor=0.5,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset(["GET"])
-    )
-    adapter = HTTPAdapter(max_retries=retries, pool_connections=20, pool_maxsize=20)
-    s.mount("http://", adapter)
-    s.mount("https://", adapter)
-    return s
+def norm_ean(s: str) -> str:
+    s = norm_text(s)
+    s = re.sub(r"\b(?:ean|gtin|barcode)\b[:\s]*", "", s, flags=re.I)
+    s = re.sub(r"[^0-9]", "", s)
+    # Accept GTIN-8/12/13/14. Most UK sites use 13.
+    if len(s) in (8, 12, 13, 14):
+        return s
+    return ""
 
-def domain_allowed(url: str) -> bool:
-    u = (url or "").lower()
-    return any(d in u for d in ALLOW_DOMAINS)
+# ---------- Generic extractors ----------
 
-def ensure_progress_table(cur):
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS enrich_progress (
-            url TEXT PRIMARY KEY,
-            done INTEGER NOT NULL DEFAULT 0,
-            updated_at TEXT
-        )
-    """)
+EAN_PAT = re.compile(r"\b(?:EAN|GTIN|Barcode)\b[:\s]*([0-9\- ]{8,20})", re.I)
+MPN_PAT = re.compile(r"\b(?:MPN|Manufacturer(?:’s|s)? Part(?: No\.?| Number)?|Model|Product Code|Man(?:uf)?\.?\s*Code)\b[:\s]*([A-Z0-9\-\/]{3,64})", re.I)
+
+def from_json_ld(soup: BeautifulSoup):
+    mpn = ean = ""
+    for tag in soup.find_all("script", type="application/ld+json"):
+        try:
+            payload = json.loads(tag.string or "")
+        except Exception:
+            continue
+        # payload can be dict or list
+        objs = payload if isinstance(payload, list) else [payload]
+        for obj in objs:
+            if not isinstance(obj, dict):
+                continue
+            mpn_try = obj.get("mpn") or obj.get("sku")
+            ean_try = obj.get("gtin13") or obj.get("gtin") or obj.get("gtin14") or obj.get("gtin8") or obj.get("gtin12")
+            if not mpn and mpn_try:
+                mpn = norm_mpn(str(mpn_try))
+            if not ean and ean_try:
+                ean = norm_ean(str(ean_try))
+    return mpn, ean
+
+def from_tables_by_labels(soup: BeautifulSoup):
+    mpn = ean = ""
+    # Look for definition lists or spec tables
+    # dt/dd pairs
+    for dl in soup.find_all(["dl"]):
+        terms = dl.find_all(["dt", "th", "strong", "span"])
+        for t in terms:
+            label = norm_text(t.get_text(" "))
+            if not label:
+                continue
+            val_el = t.find_next_sibling(["dd", "td", "span"])
+            val = norm_text(val_el.get_text(" ")) if val_el else ""
+            if not val:
+                continue
+            if not mpn and re.search(r"\b(mpn|manufacturer|model|product code|sku)\b", label, re.I):
+                mpn = norm_mpn(val)
+            if not ean and re.search(r"\b(ean|gtin|barcode)\b", label, re.I):
+                ean = norm_ean(val)
+    # tables with rows
+    for table in soup.find_all("table"):
+        for tr in table.find_all("tr"):
+            th = tr.find(["th", "td"])
+            td = None
+            if th:
+                cand = th.find_next_sibling("td")
+                if not cand:
+                    tds = tr.find_all("td")
+                    if len(tds) >= 2:
+                        th, td = tds[0], tds[1]
+                    else:
+                        continue
+                else:
+                    td = cand
+            if not th or not td:
+                continue
+            label = norm_text(th.get_text(" "))
+            val = norm_text(td.get_text(" "))
+            if not val:
+                continue
+            if not mpn and re.search(r"\b(mpn|manufacturer|model|product code|sku)\b", label, re.I):
+                mpn = norm_mpn(val)
+            if not ean and re.search(r"\b(ean|gtin|barcode)\b", label, re.I):
+                ean = norm_ean(val)
+    return mpn, ean
+
+def from_free_text(soup: BeautifulSoup):
+    mpn = ean = ""
+    text = soup.get_text(" ")
+    m = EAN_PAT.search(text)
+    if m and not ean:
+        ean = norm_ean(m.group(1))
+    m = MPN_PAT.search(text)
+    if m and not mpn:
+        mpn = norm_mpn(m.group(1))
+    return mpn, ean
+
+# ---------- Host-specific helpers ----------
+
+def extract_toolstation(soup):
+    # Toolstation typically has JSON-LD with mpn and sometimes gtin13
+    mpn, ean = from_json_ld(soup)
+    if not (mpn or ean):
+        mpn2, ean2 = from_tables_by_labels(soup)
+        mpn = mpn or mpn2
+        ean = ean or ean2
+    if not (mpn or ean):
+        mpn3, ean3 = from_free_text(soup)
+        mpn = mpn or mpn3
+        ean = ean or ean3
+    return mpn, ean
+
+def extract_ukplanettools(soup):
+    # Often shows MPN/EAN in spec table or dd/dt pairs
+    mpn, ean = from_tables_by_labels(soup)
+    if not (mpn or ean):
+        mpn2, ean2 = from_json_ld(soup)
+        mpn = mpn or mpn2
+        ean = ean or ean2
+    if not (mpn or ean):
+        mpn3, ean3 = from_free_text(soup)
+        mpn = mpn or mpn3
+        ean = ean or ean3
+    return mpn, ean
+
+def extract_dmtools(soup):
+    mpn, ean = from_tables_by_labels(soup)
+    if not (mpn or ean):
+        mpn2, ean2 = from_json_ld(soup)
+        mpn = mpn or mpn2
+        ean = ean or ean2
+    if not (mpn or ean):
+        mpn3, ean3 = from_free_text(soup)
+        mpn = mpn or mpn3
+        ean = ean or ean3
+    return mpn, ean
+
+def extract_screwfix(soup):
+    # Screwfix rarely exposes EAN; sometimes MPN in JSON-LD sku or spec table
+    mpn, ean = from_json_ld(soup)
+    if not (mpn or ean):
+        mpn2, ean2 = from_tables_by_labels(soup)
+        mpn = mpn or mpn2
+        ean = ean or ean2
+    if not (mpn or ean):
+        mpn3, ean3 = from_free_text(soup)
+        mpn = mpn or mpn3
+        ean = ean or ean3
+    return mpn, ean
+
+HOST_EXTRACTORS = {
+    "toolstation.com": extract_toolstation,
+    "ukplanettools.co.uk": extract_ukplanettools,
+    "dm-tools.co.uk": extract_dmtools,
+    "screwfix.com": extract_screwfix,
+}
+
+# ---------- Main ----------
+
+def host_from_url(url: str) -> str:
+    try:
+        h = urlparse(url).netloc.lower()
+        if h.startswith("www."):
+            h = h[4:]
+        return h
+    except Exception:
+        return ""
 
 def main():
+    allow_env = os.environ.get("ALLOW", "")
+    allow_list = [h.strip().lower() for h in allow_env.split(",") if h.strip()] or list(HOST_EXTRACTORS.keys())
+    limit_env = os.environ.get("LIMIT")
+    limit = int(limit_env) if (limit_env and limit_env.isdigit()) else None
+
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
-    cur.execute("PRAGMA foreign_keys=ON;")
-    cur.execute("PRAGMA journal_mode=WAL;")
-    ensure_progress_table(cur)
-    con.commit()
 
-    # Select distinct URLs that (a) are missing ids AND (b) are in allowed domains AND (c) not done yet
-    where_domains = " OR ".join(["url LIKE ?" for _ in ALLOW_DOMAINS])
-    params = [f"%{d}%" for d in ALLOW_DOMAINS]
+    # Candidate URLs: missing BOTH mpn and ean
+    urls = []
+    for (url,) in cur.execute("""
+        SELECT DISTINCT url
+        FROM raw_offers
+        WHERE (ean_gtin IS NULL OR ean_gtin='')
+          AND (mpn IS NULL OR mpn='')
+    """):
+        h = host_from_url(url)
+        if h in allow_list:
+            urls.append(url)
 
-    base_sql = f"""
-        SELECT DISTINCT r.url
-        FROM raw_offers r
-        LEFT JOIN enrich_progress p ON p.url = r.url
-        WHERE (r.ean_gtin IS NULL OR TRIM(r.ean_gtin) = '')
-          AND (r.mpn     IS NULL OR TRIM(r.mpn)     = '')
-          AND r.url IS NOT NULL AND TRIM(r.url) != ''
-          AND ({where_domains.replace("url", "r.url")})
-          AND COALESCE(p.done, 0) = 0
-    """
-    if LIMIT:
-        base_sql += " LIMIT ?"
-        params.append(LIMIT)
+    if limit is not None:
+        urls = urls[:limit]
 
-    cur.execute(base_sql, params)
-    urls = [r[0] for r in cur.fetchall()]
-    total = len(urls)
     print(f"DB: {DB_PATH}")
-    print(f"[{datetime.now(timezone.utc).isoformat()}] Allowed domains: {', '.join(ALLOW_DOMAINS)}")
-    print(f"[{datetime.now(timezone.utc).isoformat()}] Found {total} URL(s) to enrich (LIMIT={LIMIT or 'none'}).")
+    print(f"[{time.strftime('%Y-%m-%dT%H:%M:%S%z')}] Found {len(urls)} URLs to enrich from hosts: {', '.join(allow_list)}")
 
-    if total == 0:
-        con.close()
-        return
+    found_both = found_mpn = found_ean = found_none = 0
+    updated_rows = 0
 
-    sess = make_session()
-    updated_count = 0
-
-    for i, url in enumerate(urls, 1):
+    for idx, url in enumerate(urls, 1):
+        h = host_from_url(url)
+        extractor = HOST_EXTRACTORS.get(h)
         try:
-            resp = sess.get(url, timeout=TIMEOUT)
-            if resp.status_code != 200 or not resp.text:
-                print(f" {i}/{total} skip ({resp.status_code}) {url}")
-                cur.execute("INSERT OR REPLACE INTO enrich_progress(url, done, updated_at) VALUES(?, 1, ?)",
-                            (url, datetime.now(timezone.utc).isoformat()))
-                con.commit()
-                time.sleep(PAUSE)
-                continue
+            resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+            html = resp.text
+            soup = BeautifulSoup(html, "html.parser")
 
-            ids = extract_identifiers_from_html(resp.text)
-            ean = (ids.get("ean_gtin") or "").strip()
-            mpn = (ids.get("mpn") or "").strip()
-
-            if not ean and not mpn:
-                print(f" {i}/{total} no-ids {url}")
+            mpn = ean = ""
+            if extractor:
+                mpn, ean = extractor(soup)
             else:
+                # generic fallback
+                m1, e1 = from_json_ld(soup)
+                m2, e2 = from_tables_by_labels(soup)
+                m3, e3 = from_free_text(soup)
+                mpn = m1 or m2 or m3
+                ean = e1 or e2 or e3
+
+            if mpn and ean:
+                found_both += 1
+                status = "mpn+ean"
+            elif mpn:
+                found_mpn += 1
+                status = "mpn"
+            elif ean:
+                found_ean += 1
+                status = "ean"
+            else:
+                found_none += 1
+                status = "no-ids"
+
+            if mpn or ean:
                 cur.execute("""
                     UPDATE raw_offers
-                       SET ean_gtin = COALESCE(NULLIF(TRIM(ean_gtin), ''), ?),
-                           mpn      = COALESCE(NULLIF(TRIM(mpn), ''), ?)
-                     WHERE url = ?
+                    SET ean_gtin=COALESCE(NULLIF(ean_gtin,''), ?),
+                        mpn=COALESCE(NULLIF(mpn,''), ?)
+                    WHERE url=?
                 """, (ean or None, mpn or None, url))
-                updated_count += (1 if cur.rowcount > 0 else 0)
-                print(f" {i}/{total} updated {cur.rowcount} row(s) for {url} -> ean={ean!r} mpn={mpn!r}")
+                updated_rows += cur.rowcount
 
-            # Mark URL as done (even if no-ids) so we skip it next run
-            cur.execute("INSERT OR REPLACE INTO enrich_progress(url, done, updated_at) VALUES(?, 1, ?)",
-                        (url, datetime.now(timezone.utc).isoformat()))
-            con.commit()
-            time.sleep(PAUSE)
+            # Log every 50 URLs
+            if idx % 50 == 0 or not (mpn or ean):
+                print(f" {idx}/{len(urls)} {status} {url}")
 
+            if idx % 200 == 0:
+                con.commit()
+
+        except KeyboardInterrupt:
+            print("\nInterrupted by user. Committing progress…")
+            break
         except Exception as e:
-            print(f" {i}/{total} error {url}: {e}")
-            # Mark as done to avoid tight loops; you can DELETE FROM enrich_progress WHERE url=... to retry later
-            cur.execute("INSERT OR REPLACE INTO enrich_progress(url, done, updated_at) VALUES(?, 1, ?)",
-                        (url, datetime.now(timezone.utc).isoformat()))
-            con.commit()
+            print(f" {idx}/{len(urls)} ERROR {h} {url} :: {e}")
 
+    con.commit()
     con.close()
-    print(f"[{datetime.now(timezone.utc).isoformat()}] Enrichment complete. URLs updated: {updated_count}/{total}")
+
+    print(f"[{time.strftime('%Y-%m-%dT%H:%M:%S%z')}] Enrichment finished. "
+          f"URLs processed: {len(urls)} | rows updated: {updated_rows} "
+          f"| both: {found_both} | mpn: {found_mpn} | ean: {found_ean} | none: {found_none}")
 
 if __name__ == "__main__":
     main()
