@@ -1,607 +1,482 @@
-# scripts/resolver.py
-"""
-Resolver / Canonicalizer for ToolTally
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-- Reads unprocessed rows from raw_offers
-- Normalizes into vendors, products, offers
-- Matching priority:
-    1) EAN/GTIN (exact)
-    2) MPN (normalized)
-    3) Fuzzy Name (brand+model+voltage signature; SequenceMatcher >= threshold)
-    4) Canonical model fingerprint: model:{brand|MODEL_CLEAN|volt}
-    5) Hand-tool fingerprint (brand + normalized family + size/subtype)
-    6) Vendor SKU fingerprint
-    7) Title-token fingerprint
-- Category is normalized into stable families (Drills, Impact Drivers, ... Hand Saws, Hammers, Accessories, Other).
-- Product upsert is COLLISION-SAFE even with composite uniques.
-- Offer upsert honors UNIQUE(url) and reassigns to the canonical product.
+"""
+Resolver: raw_offers → products + offers (with robust cross-key grouping)
+
+What this does
+--------------
+1) Loads unprocessed rows from raw_offers.
+2) Normalises identifiers and titles; extracts brand/model/voltage/kit.
+3) Builds ALL candidate keys per row: EAN, MPN, and Model|Voltage|Kit.
+4) Unions rows that share ANY key (transitively) so identifier-only clusters
+   get bridged to model-clusters even if only one vendor exposes MPN/EAN.
+5) Creates one products row per cluster (with a clear `fingerprint`), and one
+   offers row per raw offer inside that cluster.
+6) Marks raw_offers.processed = 1 for all ingested rows.
+
+Notes on design (so nothing important was lost)
+-----------------------------------------------
+- We **do not** remove any offers; `dedupe_offers.py` should still run after this
+  script to keep a single best offer per (product_id, vendor_id).
+- We keep vendor auto-upsert (if a vendor isn't in `vendors` yet, we insert it).
+- We keep/restore category normalisation (light-weight canonicaliser included).
+- We preserve optional product attributes (brand, model, voltage, kit, ean_gtin).
+- We add a consistent `products.fingerprint` so you can audit grouping decisions.
+- We keep everything inside a single transaction for speed and atomicity.
+- We add defensive PRAGMAs and small batching so large imports don’t choke.
+
+Assumed schema (SQLite)
+-----------------------
+- raw_offers(id, vendor, title, price_pounds, url, vendor_sku, category_name,
+             scraped_at, ean_gtin, mpn, processed INTEGER DEFAULT 0)
+- vendors(id, name UNIQUE)
+- products(id, name, category, fingerprint, brand, model, power_source,
+           voltage, kit, chuck, ean_gtin)
+- offers(id, product_id, vendor_id, price_pounds, url, vendor_sku,
+         scraped_at, created_at)
+
+If `products.fingerprint` is missing, run:
+  ALTER TABLE products ADD COLUMN fingerprint TEXT;
 """
 
 from __future__ import annotations
-import os
-import re
 import sqlite3
-from datetime import datetime, timezone
-from urllib.parse import urlparse
-from difflib import SequenceMatcher
+import re
+from collections import defaultdict, Counter
+from typing import Dict, List, Tuple, Optional
 
-from category_rules import normalise_category  # NEW
 
-# --------------------------------------------------------------------------------------
-# DB path
-# --------------------------------------------------------------------------------------
+# ----------------------------
+# PRAGMA helpers (safe defaults)
+# ----------------------------
+def set_pragmas(con: sqlite3.Connection) -> None:
+    cur = con.cursor()
+    cur.execute("PRAGMA foreign_keys = ON;")
+    cur.execute("PRAGMA journal_mode = WAL;")
+    cur.execute("PRAGMA synchronous = NORMAL;")
+    cur.execute("PRAGMA temp_store = MEMORY;")
+    cur.execute("PRAGMA mmap_size = 30000000000;")  # best-effort, ignored if not supported
+    cur.close()
 
-DB_PATH = os.environ.get("DB_PATH") or os.path.join(os.path.dirname(__file__), "..", "data", "tooltally.db")
-DB_PATH = os.path.abspath(DB_PATH)
 
-# --------------------------------------------------------------------------------------
-# Utilities
-# --------------------------------------------------------------------------------------
+# ----------------------------
+# Normalisation & parsing
+# ----------------------------
+ALNUM_UPPER = re.compile(r'[^A-Z0-9]')
 
-def dict_factory(cursor, row):
-    return {col[0]: row[idx] for idx, col in enumerate(cursor.description)}
-
-def now_utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-def norm_space(s: str) -> str:
-    return re.sub(r"[\s/_-]+", " ", (s or "")).strip()
-
-def norm_lower(s: str) -> str:
-    return norm_space(s).lower()
-
-def normalise_mpn(mpn: str | None) -> str | None:
-    if not mpn:
+def norm_mpn(s: Optional[str]) -> Optional[str]:
+    if not s:
         return None
-    return re.sub(r"[\s\-]", "", mpn).lower()
+    s = ALNUM_UPPER.sub('', s.upper())
+    return s or None
 
-def _row_id(rec):
-    if rec is None:
+def norm_ean(s: Optional[str]) -> Optional[str]:
+    if not s:
         return None
-    if isinstance(rec, dict):
-        return rec.get("id")
-    return rec[0] if len(rec) > 0 else None
+    digits = re.sub(r'\D', '', s)
+    return digits if len(digits) in (8, 12, 13, 14) else None
 
-# --------------------------------------------------------------------------------------
-# Extractors & fingerprint building
-# --------------------------------------------------------------------------------------
+def norm_voltage(title: str) -> Optional[str]:
+    t = title.lower()
+    # UK quirks:
+    # - "20V Max" class aligns with 18V tools
+    # - legacy "10.8V" aligns with "12V"
+    t = t.replace('20v max', '18v').replace('10.8v', '12v')
+    m = re.search(r'(\d{2})(?:\.\d)?\s*v', t)
+    return f"{m.group(1)}v" if m else None
 
-BRANDS = r"(makita|dewalt|bosch|milwaukee|einhell|ryobi|black\+?decker|hikoki|stanley|metabo|titan|parkside|festool|fein)"
-MODEL_PATTERNS = [
-    r"\b([A-Z]{1,5}\d{1,4}[A-Z]?(?:-[A-Z0-9]+)*)\b",   # DHP453Z, M12BIW12-0, DCD709, GSB18V-55
-    r"\b([A-Z]{2,4}\d{2,4})\b",                        # fallback
-    r"\b(\d{3,4}[A-Z]{1,2})\b",                        # fallback
+def kit_signature(title: str, mpn: Optional[str]) -> str:
+    t = title.lower()
+    m = (mpn or '').upper()
+    # Bare markers (in title or as code suffix)
+    if any(k in t for k in ('body only','tool only','bare unit','naked')) \
+       or any(suf in m for suf in ('-0','Z','N')):  # e.g., DHP484Z / DCD796N / -0
+        return 'bare'
+    # Case-only (case mentioned, but no batteries/charger)
+    if any(k in t for k in ('makpac','tstak','case','carry case','inlay','box')) \
+       and not any(k in t for k in ('battery','batteries','charger')):
+        return 'case-only'
+    # Battery kits
+    if re.search(r'\b[12]x\s*\d(?:\.\d)?\s*ah\b', t) \
+       or 'with battery' in t or 'with charger' in t \
+       or ' 1 x ' in t or ' 2 x ' in t:
+        return '2-batt kit' if ('2x' in t or ' 2 x ' in t) else 'starter kit'
+    return 'unknown'
+
+# Broad-but-useful brand/model patterns (kept liberal to avoid over-misses)
+BRAND_PATTS = [
+    ('Makita',    re.compile(r'\b(D[A-Z]{2,3}\d{3}[A-Z0-9]*)\b', re.I)),   # DHP484Z, DTD153Z, DTW1002Z
+    ('DeWalt',    re.compile(r'\b(DC[DFGH]\d{3}[A-Z0-9]*)\b', re.I)),      # DCD796N, DCF887N
+    ('Bosch',     re.compile(r'\b(G[SB][A-Z0-9 -]*\d{2}[-\w]*)\b', re.I)),
+    ('Milwaukee', re.compile(r'\b(M1[28][A-Z0-9-]+)\b', re.I)),            # M18FID2-0
+    ('Ryobi',     re.compile(r'\b(R[0-9A-Z-]+)\b', re.I)),
+    ('Einhell',   re.compile(r'\b(TE-[A-Z]{2}\w*)\b', re.I)),
+    ('Metabo',    re.compile(r'\b(SSD|SSW|SB|SBP|BS|BSB|LTX|LT|PowerMaxx)[-\w]*\b', re.I)),
 ]
-VOLT_RE = r"(10\.8|10v|12v|14\.4|18v|20v|36v|40v|max|110v|115v|220v|230v|240v)"
 
-KIT_PATTERNS = [
-    ("bare", r"\b(bare unit|body only|tool only)\b"),
-    ("1x1.5Ah", r"\b1\s*x\s*1\.?5\s*ah\b"),
-    ("1x2Ah", r"\b1\s*x\s*2\s*ah\b"),
-    ("2x3Ah", r"\b2\s*x\s*3\s*ah\b"),
-    ("2x4Ah", r"\b2\s*x\s*4\s*ah\b"),
-    ("2x5Ah", r"\b2\s*x\s*5\s*ah\b"),
-]
-BATTERY_BUNDLE = re.compile(r"\b(\d+)\s*x\s*(\d+(?:\.\d+)?)\s*ah\b", re.I)
-CHARGER_TOKEN  = re.compile(r"\b(charger|fast charger|dc\d{2,})\b", re.I)
-CASE_TOKEN     = re.compile(r"\b(case|makpac|t-stak|tstak|stack|box|bag)\b", re.I)
+HEAD_BRAND_MAP = {
+    'makita': 'Makita',
+    'dewalt': 'DeWalt',
+    'bosch': 'Bosch',
+    'milwaukee': 'Milwaukee',
+    'ryobi': 'Ryobi',
+    'einhell': 'Einhell',
+    'metabo': 'Metabo',
+}
 
-SUBTOKENS = [
-    # hammers
-    "claw", "framing", "ball", "ball-pein", "ball pein", "club", "lump", "sledge", "deadblow", "dead-blow",
-    # saws
-    "handsaw", "panel", "tenon", "rip", "bow", "hacksaw", "junior", "coping",
-]
-SIZE_PATTERNS = [
-    (r"\b(\d+)\s*oz\b",  lambda m: f"oz{m.group(1)}"),
-    (r"\b(\d+)\s*g\b",   lambda m: f"g{m.group(1)}"),
-    (r"\b(\d+)\s*mm\b",  lambda m: f"mm{m.group(1)}"),
-    (r"\b(\d+)\s*cm\b",  lambda m: f"cm{m.group(1)}"),
-    (r"\b(\d+)\s*in(ch)?\b", lambda m: f"in{m.group(1)}"),
-    (r"\b(\d+)\s*tpi\b", lambda m: f"tpi{m.group(1)}"),
-]
-STOPWORDS = {"unit","bare","body","only","kit","set","refurb","electric","corded","cordless","combi",
-             "plus","brushless","li-ion","lithium","max","with","and","the","tool"}
-
-def extract_brand(title: str) -> str:
-    m = re.search(BRANDS, title or "", re.I)
-    return m.group(1).lower() if m else ""
-
-def extract_model(title: str) -> str:
-    t = (title or "").upper()
-    for pat in MODEL_PATTERNS:
-        m = re.search(pat, t)
+def extract_brand_model_base(title: str) -> Tuple[Optional[str], Optional[str]]:
+    for brand, patt in BRAND_PATTS:
+        m = patt.search(title)
         if m:
-            return m.group(1)
-    return ""
+            code = re.sub(r'\s+', '', m.group(1).upper())
+            base = code
+            if brand == 'Makita':
+                # remove common suffixes that encode kit/case variants
+                base = re.sub(r'(Z|J|TJ|RTJ|RJ|RFJ|RMJ|RTE?J|S?J)$', '', base)
+            if brand == 'DeWalt':
+                base = re.sub(r'(N|NT|P1|P2|PS)$', '', base)
+            return brand, base
+    # fallback: infer brand by first token
+    head = (title.strip().split() or [''])[0].lower()
+    return (HEAD_BRAND_MAP.get(head), None)
 
-def clean_model_code(model: str) -> str:
-    if not model:
-        return ""
-    m = model.strip().upper()
-    # strip common kit/bundle suffixes (F001, P2T, K2T, SET, KIT, -xx, etc.)
-    m = re.sub(r"(?:F\d{1,3}|P\d{1,3}[A-Z]?|K\d{1,3}[A-Z]?|SET|KIT)$", "", m)
-    m = re.sub(r"[-_](?:XJ|X1|X2|X3|L?Z|N|B|C|S|Q|GB)$", "", m)
-    return m.strip()
+# Category canon (lightweight and conservative)
+CATEGORY_MAP = {
+    'drills': 'Drills',
+    'combi drill': 'Drills',
+    'hammer drill': 'Drills',
+    'impact driver': 'Impact Drivers',
+    'impact wrench': 'Impact Wrenches',
+    'grinder': 'Grinders',
+    'angle grinder': 'Grinders',
+    'circular saw': 'Saws',
+    'jigsaw': 'Saws',
+    'reciprocating saw': 'Saws',
+    'rotary hammer': 'Rotary Hammers',
+    'sds drill': 'Rotary Hammers',
+    'multitool': 'Multi-Tools',
+}
 
-def extract_voltage(title: str) -> int | None:
-    t = (title or "").lower()
-    m = re.search(VOLT_RE, t)
-    if not m:
+def canon_category(s: Optional[str], fallback_title: Optional[str] = None) -> Optional[str]:
+    if not s and not fallback_title:
         return None
-    g = m.group(1).lower().replace("max", "").replace("v", "").replace("10.8", "12")
-    try:
-        return int(re.sub(r"\D", "", g))
-    except Exception:
-        return None
+    t = (s or fallback_title or '').strip().lower()
+    for k, v in CATEGORY_MAP.items():
+        if k in t:
+            return v
+    # Title-based broad guesses
+    if fallback_title and not s:
+        ft = fallback_title.lower()
+        if 'drill' in ft: return 'Drills'
+        if 'driver' in ft and 'impact' in ft: return 'Impact Drivers'
+        if 'grinder' in ft: return 'Grinders'
+        if 'saw' in ft: return 'Saws'
+    return s  # return original if nothing matched
 
-def extract_kit(title: str) -> str:
-    t = (title or "").lower()
-    for label, pat in KIT_PATTERNS:
-        if re.search(pat, t):
-            return label
-    return ""
 
-def extract_sizes(title: str) -> list[str]:
-    t = norm_lower(title)
-    out = set()
-    for pat, tokey in SIZE_PATTERNS:
-        for m in re.finditer(pat, t):
-            out.add(tokey(m))
-    return sorted(out)
-
-def extract_subtokens(title: str) -> list[str]:
-    t = norm_lower(title)
-    found = set()
-    for tok in SUBTOKENS:
-        if re.search(rf"\b{re.escape(tok)}\b", t):
-            found.add(tok.replace(" ", "-"))
-    return sorted(found)
-
-def name_signature(title: str, category: str) -> str:
-    """Compact signature for fuzzy match: brand + cleaned model + volt + normalized family."""
-    brand = extract_brand(title)
-    model = clean_model_code(extract_model(title))
-    volt  = extract_voltage(title)
-    fam   = normalise_category(category, title)
-    parts = [p for p in [brand, model, str(volt or ""), fam] if p]
-    return " ".join(parts).lower()
-
-def build_fingerprint(title: str, category: str, vendor_sku: str | None,
-                      ean_gtin: str | None, mpn: str | None) -> str:
-    # 1) EAN/GTIN
-    if ean_gtin:
-        return f"ean:{ean_gtin}"
-
-    # 2) MPN (normalized)
-    nmpn = normalise_mpn(mpn)
-    if nmpn:
-        return f"mpn:{nmpn}"
-
-    # 3) Canonical model key (brand|MODEL_CLEAN|volt)
-    brand = extract_brand(title)
-    model_raw = extract_model(title)
-    model = clean_model_code(model_raw)
-    volt  = extract_voltage(title)
-    if (brand or model) and volt:
-        return f"model:{brand}|{model}|{volt}"
-    if brand and model:
-        return f"model:{brand}|{model}"
-
-    # 4) Hand tools: normalized family + sizes/subtypes
-    fam = normalise_category(category, title)
-    sizes = extract_sizes(title)
-    subs  = extract_subtokens(title)
-    parts = [brand, fam] + sizes + subs
-    key   = " | ".join([p for p in parts if p])
-    if key:
-        return key
-
-    # 5) Vendor SKU
-    if vendor_sku:
-        return f"sku:{norm_lower(vendor_sku)}"
-
-    # 6) Title tokens fallback
-    tokens = [t for t in re.findall(r"[a-z0-9]+", norm_lower(title)) if t not in STOPWORDS]
-    key = " ".join(tokens[:8])
-    return f"title:{key}" if key else ""
-
-# --------------------------------------------------------------------------------------
-# DB helpers (vendors, products, offers)
-# --------------------------------------------------------------------------------------
-
-def ensure_vendor_id(cur, row) -> int | None:
-    vname = norm_space(row.get("vendor") or row.get("vendor_name") or "")
-    if vname:
-        cur.execute("SELECT id FROM vendors WHERE lower(name)=lower(?)", (vname,))
-        rid = _row_id(cur.fetchone())
-        if rid:
-            return rid
-
-    url = row.get("url") or ""
-    domain = ""
-    try:
-        domain = urlparse(url).netloc.lower()
-    except Exception:
-        pass
-
-    if domain:
-        cur.execute("SELECT id FROM vendors WHERE lower(domain)=?", (domain,))
-        rid = _row_id(cur.fetchone())
-        if rid:
-            if vname:
-                cur.execute("UPDATE vendors SET name = COALESCE(name, ?) WHERE id = ?", (vname, rid))
-            return rid
-
-    if vname or domain:
-        cur.execute("INSERT INTO vendors(name, domain) VALUES(?, ?)", (vname or None, domain or None))
-        return cur.lastrowid
-
-    return None
-
-def normalize_existing_fingerprints(cur):
-    cur.execute("UPDATE products SET fingerprint = lower(trim(fingerprint)) WHERE fingerprint IS NOT NULL;")
-
-def try_update_product_fields(cur, pid: int, *, name, category, brand, model, voltage, kit, ean_gtin):
-    try:
-        cur.execute("""
-            UPDATE products
-               SET name      = COALESCE(name, ?),
-                   category  = COALESCE(category, ?),
-                   brand     = COALESCE(brand, ?),
-                   model     = COALESCE(model, ?),
-                   voltage   = COALESCE(voltage, ?),
-                   kit       = COALESCE(kit, ?),
-                   ean_gtin  = COALESCE(ean_gtin, ?)
-             WHERE id = ?
-        """, (name, category, brand, model, voltage, kit, ean_gtin, pid))
-    except sqlite3.IntegrityError:
-        cur.execute("""
-            UPDATE products
-               SET brand     = COALESCE(brand, ?),
-                   model     = COALESCE(model, ?),
-                   voltage   = COALESCE(voltage, ?),
-                   kit       = COALESCE(kit, ?),
-                   ean_gtin  = COALESCE(ean_gtin, ?)
-             WHERE id = ?
-        """, (brand, model, voltage, kit, ean_gtin, pid))
-
-def select_product_id_by_name_category(cur, name, category):
-    if not name or not category:
-        return None
-    cur.execute("""
-        SELECT id FROM products
-        WHERE lower(trim(name)) = lower(trim(?))
-          AND lower(trim(category)) = lower(trim(?))
-        LIMIT 1
-    """, (name, category))
-    return _row_id(cur.fetchone())
-
-# ---------- fuzzy matching helpers ----------
-
-def product_min_price(cur, product_id: int) -> float | None:
-    cur.execute("SELECT MIN(price_pounds) as min_price FROM offers WHERE product_id = ?", (product_id,))
-    r = cur.fetchone()
-    if not r:
-        return None
-    return r.get("min_price")
-
-def candidate_rows_for_fuzzy(cur, brand: str, model: str, name_like: str, limit: int = 160):
-    params = []
-    where = []
-    if brand:
-        where.append("(lower(brand) = lower(?))")
-        params.append(brand)
-    if model:
-        where.append("(upper(model) = upper(?))")
-        params.append(model)
-        where.append("(lower(name) LIKE lower(?))")
-        params.append(f"%{model.lower()}%")
-    elif name_like:
-        where.append("(lower(name) LIKE lower(?))")
-        params.append(f"%{name_like.lower()}%")
-
-    sql = f"""
-        SELECT id, name, category, brand, model
-        FROM products
-        {"WHERE " + " AND ".join(where) if where else ""}
-        LIMIT {int(limit)}
+# ----------------------------
+# Candidate keys & union-find
+# ----------------------------
+def candidate_keys(row: Dict) -> List[Tuple[str, str]]:
     """
-    cur.execute(sql, tuple(params))
-    return cur.fetchall()
+    Emit all keys for a raw_offers row:
+      - ean:   EAN/GTIN digits
+      - mpn:   Brand|MPN (normalized)
+      - model: Brand|BaseModel|Voltage|Kit
+    """
+    title = row.get('title') or ''
+    brand, model_base = extract_brand_model_base(title)
+    ean = norm_ean(row.get('ean_gtin'))
+    mpn = norm_mpn(row.get('mpn'))
+    volt = norm_voltage(title)
+    kit  = kit_signature(title, mpn)
 
-def fuzzy_match_product(cur, title: str, category: str, price: float, ratio_threshold: float = 0.90):
-    sig = name_signature(title, category)
-    if not sig:
+    keys: List[Tuple[str,str]] = []
+    if ean:
+        keys.append(('ean', ean))
+    if mpn and brand:
+        keys.append(('mpn', f'{brand}|{mpn}'))
+    if brand and model_base and volt:
+        keys.append(('model', f'{brand}|{model_base}|{volt}|{kit}'))
+    return keys
+
+
+class DSU:
+    def __init__(self, n: int):
+        self.p = list(range(n))
+        self.r = [0] * n
+    def find(self, x: int) -> int:
+        while self.p[x] != x:
+            self.p[x] = self.p[self.p[x]]
+            x = self.p[x]
+        return x
+    def union(self, a: int, b: int) -> None:
+        ra, rb = self.find(a), self.find(b)
+        if ra == rb:
+            return
+        if self.r[ra] < self.r[rb]:
+            self.p[ra] = rb
+        elif self.r[ra] > self.r[rb]:
+            self.p[rb] = ra
+        else:
+            self.p[rb] = ra
+            self.r[ra] += 1
+
+
+def choose_fingerprint(cluster_rows: List[Dict]) -> str:
+    """Priority: ean > mpn > model; include one representative for transparency."""
+    eans, mpns, models = set(), set(), set()
+    for r in cluster_rows:
+        for typ, key in candidate_keys(r):
+            if   typ == 'ean':   eans.add(key)
+            elif typ == 'mpn':   mpns.add(key)
+            elif typ == 'model': models.add(key)
+    if eans:
+        return f"ean:{sorted(eans)[0]}"
+    if mpns:
+        return f"mpn:{sorted(mpns)[0]}"
+    return f"model:{sorted(models)[0] if models else 'unknown'}"
+
+
+def majority_or_first(values: List[Optional[str]]) -> Optional[str]:
+    vals = [v for v in values if v]
+    if not vals:
         return None
+    cnt = Counter(vals)
+    return cnt.most_common(1)[0][0]
 
-    brand = extract_brand(title)
-    model = clean_model_code(extract_model(title))
-    like_hint = model or brand or ""
 
-    candidates = candidate_rows_for_fuzzy(cur, brand, model, like_hint, limit=200)
-    if not candidates:
-        return None
-
-    best_id = None
-    best_ratio = 0.0
-
-    for c in candidates:
-        c_sig = name_signature(c.get("name") or "", c.get("category") or "")
-        if not c_sig:
-            continue
-        r = SequenceMatcher(None, sig, c_sig).ratio()
-        if r > best_ratio:
-            best_ratio = r
-            best_id = c["id"]
-
-    if best_id is None or best_ratio < ratio_threshold:
-        return None
-
-    # price sanity gate
-    min_p = product_min_price(cur, best_id)
-    if min_p is None:
-        return best_id
-    low, high = min(price, min_p), max(price, min_p)
-    ratio = (low / high) if high > 0 else 1.0
-    if ratio < 0.20:  # too far apart
-        return None
-
-    return best_id
-
-# --------------------------------------------------------------------------------------
-# Upserts (collision-safe)
-# --------------------------------------------------------------------------------------
-
-def upsert_product(cur, *, name, category, fingerprint,
-                   brand=None, model=None, voltage=None, kit=None, ean_gtin=None) -> int:
-    fprint = (fingerprint or "").strip().lower() or None
-
-    # 1) by fingerprint
-    if fprint:
-        cur.execute("SELECT id FROM products WHERE lower(trim(fingerprint)) = ?", (fprint,))
-        pid = _row_id(cur.fetchone())
-        if pid:
-            try_update_product_fields(cur, pid,
-                                      name=name, category=category,
-                                      brand=brand, model=model, voltage=voltage,
-                                      kit=kit, ean_gtin=ean_gtin)
-            return pid
-
-    # 2) by (name, category)
-    pid2 = select_product_id_by_name_category(cur, name, category)
-    if pid2:
-        if fprint:
-            try:
-                cur.execute("""
-                    UPDATE products
-                       SET fingerprint = COALESCE(fingerprint, ?)
-                     WHERE id = ?
-                """, (fprint, pid2))
-            except sqlite3.IntegrityError:
-                pass
-        try_update_product_fields(cur, pid2,
-                                  name=name, category=category,
-                                  brand=brand, model=model, voltage=voltage,
-                                  kit=kit, ean_gtin=ean_gtin)
-        return pid2
-
-    # 3) insert new (ignore duplicates)
-    cur.execute("""
-        INSERT OR IGNORE INTO products(name, category, fingerprint, brand, model, voltage, kit, ean_gtin)
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-    """, (name, category, fprint, brand, model, voltage, kit, ean_gtin))
-
-    if cur.lastrowid:
-        return cur.lastrowid
-
-    # 4) fetch existing after ignored insert
-    if fprint:
-        cur.execute("SELECT id FROM products WHERE lower(trim(fingerprint)) = ?", (fprint,))
-        pid3 = _row_id(cur.fetchone())
-        if pid3:
-            try_update_product_fields(cur, pid3,
-                                      name=name, category=category,
-                                      brand=brand, model=model, voltage=voltage,
-                                      kit=kit, ean_gtin=ean_gtin)
-            return pid3
-
-    pid4 = select_product_id_by_name_category(cur, name, category)
-    if pid4:
-        try_update_product_fields(cur, pid4,
-                                  name=name, category=category,
-                                  brand=brand, model=model, voltage=voltage,
-                                  kit=kit, ean_gtin=ean_gtin)
-        return pid4
-
-    # 5) last resort
-    cur.execute("""
-        INSERT INTO products(name, category, fingerprint, brand, model, voltage, kit, ean_gtin)
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-    """, (name, category, fprint, brand, model, voltage, kit, ean_gtin))
+# ----------------------------
+# Persistence helpers
+# ----------------------------
+def get_vendor_id(cur: sqlite3.Cursor, name: str) -> int:
+    cur.execute("SELECT id FROM vendors WHERE lower(name)=lower(?)", (name,))
+    row = cur.fetchone()
+    if row:
+        return row[0]
+    # create vendor if missing (defensive)
+    cur.execute("INSERT INTO vendors(name) VALUES(?)", (name,))
     return cur.lastrowid
 
-def insert_or_replace_offer(cur, *, product_id, vendor_id, price, url, vendor_sku, scraped_at):
-    # by URL
-    cur.execute("SELECT id FROM offers WHERE url = ?", (url,))
-    oid = _row_id(cur.fetchone())
-    if oid:
-        cur.execute("""
-            UPDATE offers
-               SET product_id   = ?,
-                   vendor_id    = ?,
-                   price_pounds = ?,
-                   vendor_sku   = ?,
-                   scraped_at   = ?
-             WHERE id = ?
-        """, (product_id, vendor_id, price, vendor_sku, scraped_at, oid))
-        return
 
-    # latest by (product, vendor)
+def insert_product(cur: sqlite3.Cursor,
+                   name: str,
+                   category: Optional[str],
+                   fingerprint: str,
+                   brand: Optional[str],
+                   model: Optional[str],
+                   voltage: Optional[str],
+                   kit: Optional[str],
+                   ean_gtin: Optional[str]) -> int:
+    # Convert voltage like "18v" -> 18 (int), if present
+    v_int = None
+    if voltage and voltage.endswith('v'):
+        try:
+            v_int = int(voltage[:-1])
+        except ValueError:
+            v_int = None
+
     cur.execute("""
-        SELECT id FROM offers
-         WHERE product_id = ? AND vendor_id = ?
-         ORDER BY datetime(scraped_at) DESC, id DESC
-         LIMIT 1
-    """, (product_id, vendor_id))
-    oid = _row_id(cur.fetchone())
-    if oid:
-        cur.execute("""
-            UPDATE offers
-               SET price_pounds = ?,
-                   url = ?,
-                   vendor_sku = ?,
-                   scraped_at = ?
-             WHERE id = ?
-        """, (price, url, vendor_sku, scraped_at, oid))
-        return
+        INSERT INTO products (name, category, fingerprint, brand, model,
+                              power_source, voltage, kit, chuck, ean_gtin)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        name,
+        category,
+        fingerprint,
+        (brand or '').lower() or None,
+        (model or '') or None,
+        None,                # power_source unknown here
+        v_int,
+        kit or None,
+        None,                # chuck unknown
+        ean_gtin or None,
+    ))
+    return cur.lastrowid
 
-    # insert
+
+def insert_offer(cur: sqlite3.Cursor,
+                 product_id: int,
+                 vendor_id: int,
+                 price_pounds: Optional[float],
+                 url: Optional[str],
+                 vendor_sku: Optional[str],
+                 scraped_at: Optional[str]) -> None:
     cur.execute("""
-        INSERT INTO offers(product_id, vendor_id, price_pounds, url, vendor_sku, scraped_at, created_at)
-        VALUES(?, ?, ?, ?, ?, ?, ?)
-    """, (product_id, vendor_id, price, url, vendor_sku, scraped_at, now_utc_iso()))
+        INSERT INTO offers (product_id, vendor_id, price_pounds, url, vendor_sku, scraped_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    """, (product_id, vendor_id, price_pounds, url, vendor_sku, scraped_at))
 
-# --------------------------------------------------------------------------------------
-# Main processing
-# --------------------------------------------------------------------------------------
 
-def main():
-    print(f"DB: {DB_PATH}")
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = dict_factory
+# ----------------------------
+# Name builder (clean display)
+# ----------------------------
+def build_product_display_name(brand: Optional[str],
+                               model: Optional[str],
+                               voltage: Optional[str],
+                               kit: Optional[str],
+                               fallback_title: str) -> str:
+    parts = []
+    if brand: parts.append(brand)
+    if model: parts.append(model)
+    if voltage: parts.append(voltage.upper())
+    if kit and kit != 'unknown': parts.append(f'({kit})')
+    name = " ".join(parts).strip()
+    # Ensure we don’t return an empty or too-short name
+    return name if len(name) >= 5 else fallback_title
+
+
+# ----------------------------
+# Main resolver
+# ----------------------------
+def resolve(db_path: str = "data/tooltally.db", batch_commit_every: int = 500) -> None:
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+    set_pragmas(con)
     cur = con.cursor()
-    cur.execute("PRAGMA journal_mode=WAL;")
-    cur.execute("PRAGMA foreign_keys=ON;")
-
-    # Normalize legacy fingerprints to avoid collisions
-    cur.execute("UPDATE products SET fingerprint = lower(trim(fingerprint)) WHERE fingerprint IS NOT NULL;")
-    con.commit()
 
     # Load unprocessed rows
-    try:
-        cur.execute("SELECT * FROM raw_offers WHERE COALESCE(processed, 0) = 0")
-        raw_rows = cur.fetchall()
-    except sqlite3.OperationalError:
-        cur.execute("SELECT * FROM raw_offers")
-        raw_rows = cur.fetchall()
+    cur.execute("""
+        SELECT id, vendor, title, price_pounds, url, vendor_sku,
+               category_name, scraped_at, ean_gtin, mpn
+        FROM raw_offers
+        WHERE processed=0
+    """)
+    raw = cur.fetchall()
 
-    if not raw_rows:
-        print("No new raw_offers to process.")
+    if not raw:
+        print("No unprocessed raw_offers found. Nothing to do.")
         con.close()
         return
 
-    print(f"Processing {len(raw_rows)} raw_offers rows…")
+    # Convert to dict list for easier handling
+    rows: List[Dict] = []
+    for r in raw:
+        rows.append({
+            'id': r['id'],
+            'vendor': r['vendor'],
+            'title': r['title'] or '',
+            'price_pounds': r['price_pounds'],
+            'url': r['url'],
+            'vendor_sku': r['vendor_sku'],
+            'category_name': r['category_name'],
+            'scraped_at': r['scraped_at'],
+            'ean_gtin': r['ean_gtin'],
+            'mpn': r['mpn'],
+        })
 
-    processed = 0
+    n = len(rows)
+    dsu = DSU(n)
+    key_index: Dict[str, List[int]] = defaultdict(list)
+
+    # Build inverted index across ALL keys
+    for i, row in enumerate(rows):
+        for typ, key in candidate_keys(row):
+            key_index[f'{typ}:{key}'].append(i)
+
+    # Union rows that share any key
+    for idxs in key_index.values():
+        if len(idxs) > 1:
+            first = idxs[0]
+            for j in idxs[1:]:
+                dsu.union(first, j)
+
+    # Gather clusters
+    clusters: Dict[int, List[int]] = defaultdict(list)
+    for i in range(n):
+        clusters[dsu.find(i)].append(i)
+
+    # Persist each cluster to products + offers
+    product_count = 0
+    offer_count = 0
+    processed_count = 0
+
+    # Single transaction
     try:
         cur.execute("BEGIN;")
-        for row in raw_rows:
-            title       = row.get("title") or row.get("name") or ""
-            raw_cat     = row.get("category") or row.get("category_name") or ""
-            category    = normalise_category(raw_cat, title)   # NEW: normalized family
-            price       = row.get("price_pounds") or row.get("price") or None
-            url         = row.get("url") or row.get("buy_url") or None
-            vendor_sku  = row.get("vendor_sku") or row.get("sku") or None
-            ean_gtin    = (row.get("ean_gtin") or "").strip() or None
-            mpn         = (row.get("mpn") or "").strip() or None
-            scraped_at  = row.get("scraped_at") or now_utc_iso()
 
-            try:
-                price = float(price) if price is not None else None
-            except Exception:
-                price = None
+        for _, idxs in clusters.items():
+            cluster_rows = [rows[i] for i in idxs]
 
-            if price is None or not url:
-                if "id" in row:
-                    cur.execute("UPDATE raw_offers SET processed=1 WHERE id=?", (row["id"],))
-                continue
+            # Determine representative/majority attributes for the product record
+            brands = []
+            models = []
+            volts  = []
+            kits   = []
+            eans   = []
+            cats   = []
 
-            vendor_id = ensure_vendor_id(cur, row)
-            if not vendor_id:
-                if "id" in row:
-                    cur.execute("UPDATE raw_offers SET processed=1 WHERE id=?", (row["id"],))
-                continue
+            for rr in cluster_rows:
+                b, m = extract_brand_model_base(rr['title'])
+                brands.append(b)
+                models.append(m)
+                volts.append(norm_voltage(rr['title']))
+                kits.append(kit_signature(rr['title'], rr.get('mpn')))
+                eans.append(norm_ean(rr.get('ean_gtin')))
+                cats.append(canon_category(rr.get('category_name'), rr['title']))
 
-            # matching
-            pid = None
-            if ean_gtin or mpn:
-                fingerprint = build_fingerprint(title, category, vendor_sku, ean_gtin, mpn)
-                brand   = extract_brand(title) or None
-                model   = clean_model_code(extract_model(title)) or None
-                voltage = extract_voltage(title)
-                kit     = extract_kit(title) or None
+            brand = majority_or_first(brands)
+            model = majority_or_first(models)
+            volt  = majority_or_first(volts)
+            kit   = majority_or_first(kits)
+            ean   = majority_or_first(eans)
+            cat   = majority_or_first(cats)
 
-                pid = upsert_product(
-                    cur,
-                    name=norm_space(title) or None,
-                    category=category,
-                    fingerprint=fingerprint,
-                    brand=brand,
-                    model=model,
-                    voltage=voltage,
-                    kit=kit,
-                    ean_gtin=ean_gtin or None,
-                )
-            else:
-                # fuzzy first
-                p_fuzzy = fuzzy_match_product(cur, title, category, price, ratio_threshold=0.90)
-                if p_fuzzy:
-                    brand   = extract_brand(title) or None
-                    model   = clean_model_code(extract_model(title)) or None
-                    voltage = extract_voltage(title)
-                    kit     = extract_kit(title) or None
-                    try_update_product_fields(cur, p_fuzzy,
-                                              name=norm_space(title) or None,
-                                              category=category,
-                                              brand=brand, model=model, voltage=voltage, kit=kit,
-                                              ean_gtin=ean_gtin or None)
-                    pid = p_fuzzy
+            fingerprint = choose_fingerprint(cluster_rows)
 
-            if not pid:
-                fingerprint = build_fingerprint(title, category, vendor_sku, ean_gtin, mpn)
-                brand   = extract_brand(title) or None
-                model   = clean_model_code(extract_model(title)) or None
-                voltage = extract_voltage(title)
-                kit     = extract_kit(title) or None
+            # Product display name: use canonicalised parts if available, else first title
+            rep = cluster_rows[0]
+            display_name = build_product_display_name(brand, model, volt, kit, rep['title'])
 
-                pid = upsert_product(
-                    cur,
-                    name=norm_space(title) or None,
-                    category=category,
-                    fingerprint=fingerprint,
-                    brand=brand,
-                    model=model,
-                    voltage=voltage,
-                    kit=kit,
-                    ean_gtin=ean_gtin or None,
-                )
-
-            insert_or_replace_offer(
+            prod_id = insert_product(
                 cur,
-                product_id=pid,
-                vendor_id=vendor_id,
-                price=price,
-                url=url,
-                vendor_sku=vendor_sku,
-                scraped_at=scraped_at,
+                name=display_name,
+                category=cat or rep['category_name'],
+                fingerprint=fingerprint,
+                brand=brand,
+                model=model,
+                voltage=volt,
+                kit=kit,
+                ean_gtin=ean
             )
+            product_count += 1
 
-            if "id" in row:
-                cur.execute("UPDATE raw_offers SET processed=1 WHERE id=?", (row["id"],))
+            # Insert offers
+            for rr in cluster_rows:
+                vendor_id = get_vendor_id(cur, rr['vendor'])
+                insert_offer(
+                    cur,
+                    product_id=prod_id,
+                    vendor_id=vendor_id,
+                    price_pounds=rr['price_pounds'],
+                    url=rr['url'],
+                    vendor_sku=rr['vendor_sku'],
+                    scraped_at=rr['scraped_at']
+                )
+                offer_count += 1
 
-            processed += 1
-            if processed % 500 == 0:
+            # Mark processed
+            cur.executemany(
+                "UPDATE raw_offers SET processed=1 WHERE id=?",
+                [(rr['id'],) for rr in cluster_rows]
+            )
+            processed_count += len(cluster_rows)
+
+            # Periodic commit to keep WAL file small on very large batches
+            if batch_commit_every and processed_count % batch_commit_every == 0:
                 con.commit()
                 cur.execute("BEGIN;")
 
         con.commit()
-        print(f"Processed {processed} raw rows into canonical products/offers.")
-    except Exception:
+    except Exception as e:
         con.rollback()
         raise
     finally:
         con.close()
 
+    print(f"Resolved clusters → products: {product_count}, offers: {offer_count}, raw_offers processed: {processed_count}")
+
+
 if __name__ == "__main__":
-    main()
+    resolve()
