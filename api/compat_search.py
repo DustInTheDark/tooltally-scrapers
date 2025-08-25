@@ -2,14 +2,10 @@
 # -*- coding: utf-8 -*-
 
 """
-Compat API for ToolTally
-- /products: robust search + pagination, lowest_price ignores 0/NULL and rows without URL
-- /product/<id>: vendor offers chosen with URL-first + real (non-zero) price
-- /search?query=: single-product convenience
-
-Run:
-  pip install flask flask-cors
-  py api\\compat_search.py
+Compat API for ToolTally — now with /categories and category filtering.
+- /categories: list distinct categories with counts
+- /products: search + pagination (+ optional ?category=), lowest_price ignores 0/NULL and rows without URL
+- /product/<pid>: detail + offers (best row per vendor), TEXT-safe ids
 """
 
 from __future__ import annotations
@@ -28,11 +24,11 @@ DB_PATH = "data/tooltally.db"
 app = Flask(__name__)
 if CORS:
     CORS(app, resources={
-        r"/products*": {"origins": ["http://localhost:3000", "http://127.0.0.1:3000"]},
-        r"/product/*": {"origins": ["http://localhost:3000", "http://127.0.0.1:3000"]},
-        r"/search":    {"origins": ["http://localhost:3000", "http://127.0.0.1:3000"]},
+        r"/categories": {"origins": ["http://localhost:3000", "http://127.0.0.1:3000"]},
+        r"/products*":  {"origins": ["http://localhost:3000", "http://127.0.0.1:3000"]},
+        r"/product/*":  {"origins": ["http://localhost:3000", "http://127.0.0.1:3000"]},
+        r"/search":     {"origins": ["http://localhost:3000", "http://127.0.0.1:3000"]},
     })
-
 
 # ---------------- DB ----------------
 def open_db() -> sqlite3.Connection:
@@ -40,8 +36,7 @@ def open_db() -> sqlite3.Connection:
     con.row_factory = sqlite3.Row
     return con
 
-
-# ---------------- search helpers ----------------
+# ---------------- helpers ----------------
 ALNUM_UPPER = re.compile(r'[^A-Z0-9]+')
 MODEL_CODE  = re.compile(r'\b([A-Z]{2,5}\d{2,4}[A-Z0-9-]*)\b', re.I)
 
@@ -49,11 +44,10 @@ def norm_alnum_upper(s: str) -> str:
     return ALNUM_UPPER.sub('', (s or '').upper())
 
 def normalize_query(q: str) -> str:
-    """Handle UK tool quirks like '20DHP484' and volt aliases."""
     t = q or ""
     t = re.sub(r'20\s*v\s*max', '18v', t, flags=re.I)
     t = re.sub(r'10\.8\s*v', '12v', t, flags=re.I)
-    t = re.sub(r'\b20(?=[A-Za-z]{2,}\d)', '', t)  # drop stray leading 20 before model codes
+    t = re.sub(r'\b20(?=[A-Za-z]{2,}\d)', '', t)
     return t.strip()
 
 def extract_model_from_query(q: str) -> Optional[str]:
@@ -65,10 +59,6 @@ def extract_model_from_query(q: str) -> Optional[str]:
     return base
 
 def build_search_parts(q_raw: str) -> Tuple[str, List[Any], Optional[str], Optional[int], Tuple[str, List[Any]]]:
-    """
-    Build primary WHERE + params, a score_expr/threshold (HAVING), and a permissive fallback WHERE.
-    We keep placeholders only for WHERE; HAVING uses inlined terms (no bindings mismatch).
-    """
     q = normalize_query(q_raw)
     params: List[Any] = []
     clauses: List[str] = []
@@ -112,16 +102,8 @@ def build_search_parts(q_raw: str) -> Tuple[str, List[Any], Optional[str], Optio
 
     return primary_where, params, score_expr, score_threshold, (fallback_where, fb_params)
 
-
 # ---------------- offers helper ----------------
-def get_offers(cur: sqlite3.Cursor, product_id: int) -> List[Dict[str, Any]]:
-    """
-    For each vendor, pick the single best row:
-      - prefer rows WITH a URL
-      - prefer real price (non-zero, non-null)
-      - then lowest price
-      - then lowest id
-    """
+def get_offers(cur: sqlite3.Cursor, product_id_text: str) -> List[Dict[str, Any]]:
     cur.execute("""
         WITH ranked AS (
           SELECT
@@ -139,7 +121,7 @@ def get_offers(cur: sqlite3.Cursor, product_id: int) -> List[Dict[str, Any]]:
             ) AS rn
           FROM offers o
           JOIN vendors v ON v.id = o.vendor_id
-          WHERE o.product_id = ?
+          WHERE CAST(o.product_id AS TEXT) = ?
         )
         SELECT vendor_name, price, vendor_product_url
         FROM ranked
@@ -147,7 +129,7 @@ def get_offers(cur: sqlite3.Cursor, product_id: int) -> List[Dict[str, Any]]:
         ORDER BY
           CASE WHEN (price IS NULL OR price=0) THEN 1 ELSE 0 END ASC,
           price ASC
-    """, (product_id,))
+    """, (str(product_id_text),))
     out: List[Dict[str, Any]] = []
     for r in cur.fetchall():
         price = float(r["price"]) if r["price"] is not None else None
@@ -161,21 +143,36 @@ def get_offers(cur: sqlite3.Cursor, product_id: int) -> List[Dict[str, Any]]:
         })
     return out
 
+# ---------------- NEW: categories endpoint ----------------
+@app.get("/categories")
+def categories():
+    con = open_db()
+    try:
+        cur = con.cursor()
+        rows = cur.execute("""
+            SELECT COALESCE(NULLIF(TRIM(category),''),'Uncategorized') AS name,
+                   COUNT(*) AS count
+            FROM products
+            GROUP BY name
+            ORDER BY count DESC, name ASC
+        """).fetchall()
 
-# ---------------- list endpoint ----------------
+        def slugify(s: str) -> str:
+            s = s.strip().lower()
+            s = re.sub(r'[^a-z0-9]+', '-', s)
+            s = re.sub(r'-{2,}', '-', s).strip('-')
+            return s or 'uncategorized'
+
+        items = [{"name": r["name"], "slug": slugify(r["name"]), "count": int(r["count"])} for r in rows]
+        return jsonify({"items": items})
+    finally:
+        con.close()
+
+# ---------------- list endpoint (with optional category) ----------------
 @app.get("/products")
 def products():
-    """
-    Query params:
-      search: string (optional)
-      page:   int (1-based, default 1)
-      limit:  int (default 24)
-
-    Returns:
-      { items: [ {id, title, brand, image_url, lowest_price, vendor_count}... ],
-        total, page, limit }
-    """
     q_raw = (request.args.get("search") or "").strip()
+    category_raw = (request.args.get("category") or "").strip()
     page  = max(int(request.args.get("page") or 1), 1)
     limit = max(min(int(request.args.get("limit") or 24), 100), 1)
     offset = (page - 1) * limit
@@ -184,9 +181,27 @@ def products():
     try:
         cur = con.cursor()
 
+        # Build WHERE
+        where_sql = ""
+        where_params: List[Any] = []
+        use_score_expr = None
+        use_threshold = None
+
+        # Category filter first (AND)
+        if category_raw:
+            where_sql += ("WHERE " if not where_sql else " AND ") + "COALESCE(p.category,'') = ?"
+            where_params.append(category_raw)
+
         if q_raw:
             primary_where, primary_params, score_expr, score_threshold, fallback = build_search_parts(q_raw)
 
+            if where_sql:
+                # combine category AND (...) search
+                primary_where = primary_where.replace("WHERE ", "", 1)
+                primary_where = "WHERE " + where_sql.replace("WHERE ", "") + " AND (" + primary_where + ")"
+                primary_params = where_params + primary_params
+
+            # count
             cur.execute(f"SELECT COUNT(*) FROM products p {primary_where}", primary_params)
             total = int(cur.fetchone()[0])
 
@@ -195,26 +210,35 @@ def products():
 
             if total == 0 and fallback:
                 fb_where, fb_params = fallback
+                if where_sql:
+                    fb_where = fb_where.replace("WHERE ", "", 1)
+                    fb_where = "WHERE " + where_sql.replace("WHERE ", "") + " AND (" + fb_where + ")"
+                    fb_params = where_params + fb_params
                 cur.execute(f"SELECT COUNT(*) FROM products p {fb_where}", fb_params)
                 total = int(cur.fetchone()[0])
                 use_where, use_params = fb_where, fb_params
                 use_score_expr, use_threshold = None, None
         else:
-            use_where, use_params = "", []
-            total = cur.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+            # no search; category-only (or full)
+            if where_sql:
+                cur.execute(f"SELECT COUNT(*) FROM products p {where_sql}", where_params)
+                total = int(cur.fetchone()[0])
+                use_where, use_params = where_sql, where_params
+            else:
+                total = cur.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+                use_where, use_params = "", []
             use_score_expr, use_threshold = None, None
 
-        # lowest_price & vendor_count should only consider rows with a URL and real price
         having_clause = f"HAVING ({use_score_expr}) >= {use_threshold}" if (use_score_expr and use_threshold is not None) else ""
         list_sql = f"""
             WITH o1 AS (
               SELECT
-                o.product_id,
+                CAST(o.product_id AS TEXT) AS pid,
                 o.vendor_id,
                 o.price_pounds,
                 o.url,
                 ROW_NUMBER() OVER (
-                  PARTITION BY o.product_id, o.vendor_id
+                  PARTITION BY CAST(o.product_id AS TEXT), o.vendor_id
                   ORDER BY
                     CASE WHEN (o.url IS NULL OR o.url='') THEN 1 ELSE 0 END ASC,
                     CASE WHEN (o.price_pounds IS NULL OR o.price_pounds=0) THEN 1 ELSE 0 END ASC,
@@ -224,14 +248,14 @@ def products():
               FROM offers o
             )
             SELECT
-              p.id,
+              CAST(p.id AS TEXT) AS id,
               p.name AS title,
               p.brand,
               NULL   AS image_url,
               COALESCE(MIN(NULLIF(CASE WHEN (o1.url IS NULL OR o1.url='') THEN NULL ELSE o1.price_pounds END,0)), NULL) AS lowest_price,
               COUNT(DISTINCT CASE WHEN (o1.url IS NOT NULL AND o1.url<>'') THEN o1.vendor_id END) AS vendor_count
             FROM products p
-            LEFT JOIN o1 ON (o1.product_id = p.id AND o1.rn = 1)
+            LEFT JOIN o1 ON (o1.pid = CAST(p.id AS TEXT) AND o1.rn = 1)
             {use_where}
             GROUP BY p.id
             {having_clause}
@@ -251,31 +275,24 @@ def products():
                 "vendor_count": int(row["vendor_count"] or 0),
             })
 
-        return jsonify({
-            "items": items,
-            "total": int(total),
-            "page": page,
-            "limit": limit,
-        })
+        return jsonify({"items": items, "total": int(total), "page": page, "limit": limit})
     finally:
         con.close()
 
-
 # ---------------- product detail endpoint ----------------
-@app.get("/product/<int:pid>")
-def product_detail(pid: int):
+@app.get("/product/<pid>")
+def product_detail(pid: str):
     con = open_db()
     try:
         cur = con.cursor()
-        cur.execute("SELECT * FROM products WHERE id = ?", (pid,))
+        cur.execute("SELECT * FROM products WHERE CAST(id AS TEXT) = ?", (str(pid),))
         p = cur.fetchone()
         if not p:
             abort(404)
-
-        offers = get_offers(cur, pid)
+        offers = get_offers(cur, str(pid))
         return jsonify({
             "product_info": {
-                "id": p["id"],
+                "id": str(p["id"]),
                 "title": p["name"] or "",
                 "brand": (p["brand"] or "").title() if p["brand"] else "",
                 "description": "",
@@ -285,7 +302,6 @@ def product_detail(pid: int):
         })
     finally:
         con.close()
-
 
 # ---------------- single-product convenience ----------------
 @app.get("/search")
@@ -324,10 +340,11 @@ def search():
         if not p:
             return jsonify({"product_info": {}, "offers": []})
 
-        offers = get_offers(cur, p["id"])
+        pid_text = str(p["id"])
+        offers = get_offers(cur, pid_text)
         return jsonify({
             "product_info": {
-                "id": p["id"],
+                "id": pid_text,
                 "title": p["name"] or "",
                 "brand": (p["brand"] or "").title() if p["brand"] else "",
                 "description": "",
@@ -338,6 +355,6 @@ def search():
     finally:
         con.close()
 
-
 if __name__ == "__main__":
+    print(f"DB_PATH = {DB_PATH}")
     app.run(host="127.0.0.1", port=5000, debug=True)
