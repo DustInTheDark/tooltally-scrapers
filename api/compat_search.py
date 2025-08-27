@@ -67,14 +67,12 @@ def build_search_parts(q_raw: str) -> Tuple[str, List[Any], Optional[str], Optio
     params: List[Any] = []
     clauses: List[str] = []
 
-    # model priority
     model = extract_model_from_query(q)
     if model:
         like_model = f"%{model}%"
         clauses.append("(p.model LIKE ? OR p.name LIKE ?)")
         params.extend([like_model, like_model])
 
-    # normalized contains
     q_norm = norm_alnum_upper(q)
     norm_clause = "(REPLACE(REPLACE(UPPER(p.name),' ','') ,'-','') LIKE ? OR REPLACE(REPLACE(UPPER(COALESCE(p.model,'')),' ','') ,'-','') LIKE ?)"
     params.extend([f"%{q_norm}%", f"%{q_norm}%"])
@@ -95,7 +93,6 @@ def build_search_parts(q_raw: str) -> Tuple[str, List[Any], Optional[str], Optio
 
     primary_where = "WHERE " + " OR ".join(clauses) if clauses else ""
 
-    # fallback: OR over tokens only
     fb_params: List[Any] = []
     or_pieces: List[str] = []
     for t in tokens:
@@ -153,7 +150,6 @@ def categories():
     con = open_db()
     try:
         cur = con.cursor()
-        # Normalize + group in SQL to avoid duplicates (trim, case, empty -> 'Uncategorized')
         rows = cur.execute("""
             WITH norm AS (
               SELECT
@@ -180,7 +176,6 @@ def categories():
             s = re.sub(r'-{2,}', '-', s).strip('-')
             return s or 'uncategorized'
 
-        # Double-check dedupe in Python (belt & braces)
         by_slug: Dict[str, Dict[str, Any]] = {}
         for r in rows:
             name = r["name"]
@@ -191,7 +186,7 @@ def categories():
             else:
                 by_slug[slug] = {"name": name, "slug": slug, "count": count}
 
-        items = sorted(by_slug.values(), key=lambda x: (-x["count"], x["name"]))
+        items = sorted(by_slug.values(), key=lambda x: x["name"])
         return jsonify({"items": items})
     finally:
         con.close()
@@ -209,13 +204,11 @@ def products():
     try:
         cur = con.cursor()
 
-        # Build WHERE
         where_sql = ""
         where_params: List[Any] = []
         use_score_expr = None
         use_threshold = None
 
-        # Category filter first (normalize like we do in /categories)
         if category_raw:
             where_sql += ("WHERE " if not where_sql else " AND ") + """
               CASE
@@ -281,7 +274,7 @@ def products():
               CAST(p.id AS TEXT) AS id,
               p.name AS title,
               p.brand,
-              NULL   AS image_url,
+              p.image_url AS image_url,  -- << return real image
               COALESCE(MIN(NULLIF(CASE WHEN (o1.url IS NULL OR o1.url='') THEN NULL ELSE o1.price_pounds END,0)), NULL) AS lowest_price,
               COUNT(DISTINCT CASE WHEN (o1.url IS NOT NULL AND o1.url<>'') THEN o1.vendor_id END) AS vendor_count
             FROM products p
@@ -300,7 +293,7 @@ def products():
                 "id": row["id"],
                 "title": row["title"],
                 "brand": (row["brand"] or "").title() if row["brand"] else None,
-                "image_url": row["image_url"],
+                "image_url": row["image_url"],  # << use it
                 "lowest_price": float(row["lowest_price"]) if row["lowest_price"] is not None else None,
                 "vendor_count": int(row["vendor_count"] or 0),
             })
@@ -326,7 +319,7 @@ def product_detail(pid: str):
                 "title": p["name"] or "",
                 "brand": (p["brand"] or "").title() if p["brand"] else "",
                 "description": "",
-                "image_url": None,
+                "image_url": p["image_url"],  # << return actual image for detail too
             },
             "offers": offers,
         })
@@ -378,7 +371,7 @@ def search():
                 "title": p["name"] or "",
                 "brand": (p["brand"] or "").title() if p["brand"] else "",
                 "description": "",
-                "image_url": None,
+                "image_url": p["image_url"],  # << include here as well
             },
             "offers": offers,
         })
