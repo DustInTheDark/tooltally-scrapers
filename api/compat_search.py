@@ -2,10 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-Compat API for ToolTally — now with /categories and category filtering.
-- /categories: list distinct categories with counts
+Compat API for ToolTally — with /categories (deduped) and category filtering.
+- /categories: list distinct categories with counts (normalized to avoid dupes)
 - /products: search + pagination (+ optional ?category=), lowest_price ignores 0/NULL and rows without URL
 - /product/<pid>: detail + offers (best row per vendor), TEXT-safe ids
+
+Run:
+  pip install flask flask-cors
+  py api\\compat_search.py
 """
 
 from __future__ import annotations
@@ -143,18 +147,31 @@ def get_offers(cur: sqlite3.Cursor, product_id_text: str) -> List[Dict[str, Any]
         })
     return out
 
-# ---------------- NEW: categories endpoint ----------------
+# ---------------- CATEGORIES (deduped) ----------------
 @app.get("/categories")
 def categories():
     con = open_db()
     try:
         cur = con.cursor()
+        # Normalize + group in SQL to avoid duplicates (trim, case, empty -> 'Uncategorized')
         rows = cur.execute("""
-            SELECT COALESCE(NULLIF(TRIM(category),''),'Uncategorized') AS name,
-                   COUNT(*) AS count
-            FROM products
+            WITH norm AS (
+              SELECT
+                CASE
+                  WHEN TRIM(COALESCE(category,'')) = '' THEN 'Uncategorized'
+                  ELSE TRIM(category)
+                END AS name_trim
+              FROM products
+            ),
+            pretty AS (
+              SELECT
+                UPPER(SUBSTR(name_trim,1,1)) || LOWER(SUBSTR(name_trim,2)) AS name
+              FROM norm
+            )
+            SELECT name, COUNT(*) AS count
+            FROM pretty
             GROUP BY name
-            ORDER BY count DESC, name ASC
+            ORDER BY name ASC
         """).fetchall()
 
         def slugify(s: str) -> str:
@@ -163,7 +180,18 @@ def categories():
             s = re.sub(r'-{2,}', '-', s).strip('-')
             return s or 'uncategorized'
 
-        items = [{"name": r["name"], "slug": slugify(r["name"]), "count": int(r["count"])} for r in rows]
+        # Double-check dedupe in Python (belt & braces)
+        by_slug: Dict[str, Dict[str, Any]] = {}
+        for r in rows:
+            name = r["name"]
+            count = int(r["count"] or 0)
+            slug = slugify(name)
+            if slug in by_slug:
+                by_slug[slug]["count"] += count
+            else:
+                by_slug[slug] = {"name": name, "slug": slug, "count": count}
+
+        items = sorted(by_slug.values(), key=lambda x: (-x["count"], x["name"]))
         return jsonify({"items": items})
     finally:
         con.close()
@@ -187,21 +215,24 @@ def products():
         use_score_expr = None
         use_threshold = None
 
-        # Category filter first (AND)
+        # Category filter first (normalize like we do in /categories)
         if category_raw:
-            where_sql += ("WHERE " if not where_sql else " AND ") + "COALESCE(p.category,'') = ?"
-            where_params.append(category_raw)
+            where_sql += ("WHERE " if not where_sql else " AND ") + """
+              CASE
+                WHEN TRIM(COALESCE(p.category,''))='' THEN 'Uncategorized'
+                ELSE UPPER(SUBSTR(TRIM(p.category),1,1)) || LOWER(SUBSTR(TRIM(p.category),2))
+              END = ?
+            """
+            where_params.append(category_raw.strip())
 
         if q_raw:
             primary_where, primary_params, score_expr, score_threshold, fallback = build_search_parts(q_raw)
 
             if where_sql:
-                # combine category AND (...) search
                 primary_where = primary_where.replace("WHERE ", "", 1)
                 primary_where = "WHERE " + where_sql.replace("WHERE ", "") + " AND (" + primary_where + ")"
                 primary_params = where_params + primary_params
 
-            # count
             cur.execute(f"SELECT COUNT(*) FROM products p {primary_where}", primary_params)
             total = int(cur.fetchone()[0])
 
@@ -219,7 +250,6 @@ def products():
                 use_where, use_params = fb_where, fb_params
                 use_score_expr, use_threshold = None, None
         else:
-            # no search; category-only (or full)
             if where_sql:
                 cur.execute(f"SELECT COUNT(*) FROM products p {where_sql}", where_params)
                 total = int(cur.fetchone()[0])
